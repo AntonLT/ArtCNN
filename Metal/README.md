@@ -68,6 +68,14 @@ xcrun xctrace record --template ArtCNN --env ARTCNN_ONLY_PASS=1 --output layer.t
 python tools/counters.py layer.trace
 ```
 
+For register counts, spills and per-line costs, save one frame as a GPU trace and open it
+in Xcode (Profile the trace, then look at the pipeline statistics of each `artcnn_pass`):
+
+```
+MTL_CAPTURE_ENABLED=1 ARTCNN_CAPTURE=frame.gputrace \
+    build/artcnn_metal_cli ArtCNN_C4F16_DS.metal in.f32 1512 982 out.f32
+```
+
 For a 16->16 Winograd layer the GPU holds occupancy at about 33% (occupancy manager
 target 42%) with the F16 limiter at 73% and the last-level cache limiter at 85%; a plain
 copy kernel reaches 89% occupancy. Raising occupancy is the next lever.

@@ -50,6 +50,27 @@ int main(int argc, const char *argv[])
         id<MTLTexture> output = [artcnn newOutputTextureForInputWidth:width height:height];
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
+        // ARTCNN_CAPTURE=path.gputrace saves one full frame as a Metal GPU trace for Xcode
+        // (needs MTL_CAPTURE_ENABLED=1). Xcode shows registers, spills and occupancy per kernel.
+        if (getenv("ARTCNN_CAPTURE")) {
+            MTLCaptureDescriptor *capture = [MTLCaptureDescriptor new];
+            capture.captureObject = queue;
+            capture.destination = MTLCaptureDestinationGPUTraceDocument;
+            capture.outputURL = [NSURL fileURLWithPath:@(getenv("ARTCNN_CAPTURE"))];
+            NSError *captureError = nil;
+            if (![[MTLCaptureManager sharedCaptureManager] startCaptureWithDescriptor:capture error:&captureError]) {
+                fprintf(stderr, "capture failed: %s\n", captureError.description.UTF8String);
+                return 1;
+            }
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            cb.label = @"ArtCNN frame";
+            [artcnn encodeToCommandBuffer:cb input:input output:output];
+            [cb commit];
+            [cb waitUntilCompleted];
+            [[MTLCaptureManager sharedCaptureManager] stopCapture];
+            printf("saved GPU trace to %s\n", getenv("ARTCNN_CAPTURE"));
+        }
+
         // ARTCNN_ONLY_PASS=n runs just that pass in the timing loops, for counter captures.
         NSRange passes = NSMakeRange(0, artcnn.passCount);
         if (getenv("ARTCNN_ONLY_PASS")) {

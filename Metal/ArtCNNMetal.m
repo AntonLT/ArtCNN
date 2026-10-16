@@ -8,6 +8,7 @@
 @property (nonatomic) MTLSize threads;
 @property (nonatomic) float scaleX;
 @property (nonatomic) float scaleY;
+@property (nonatomic) NSString *name;
 @end
 
 @implementation ArtCNNPass
@@ -52,6 +53,7 @@
         if (!pass.pipeline) {
             return nil;
         }
+        pass.name = [NSString stringWithFormat:@"%@: %@", name, [source substringWithRange:NSMakeRange(NSMaxRange(m.range), [source lineRangeForRange:m.range].location + [source lineRangeForRange:m.range].length - NSMaxRange(m.range))]];
         pass.binds = [group(2) componentsSeparatedByString:@","];
         pass.save = group(3);
         pass.block = MTLSizeMake(group(4).integerValue, group(5).integerValue, 1);
@@ -152,6 +154,7 @@
 
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
     for (ArtCNNPass *pass in [_passes subarrayWithRange:range]) {
+        [encoder pushDebugGroup:pass.name];
         [encoder setComputePipelineState:pass.pipeline];
         NSUInteger index = 0;
         for (NSString *bind in pass.binds) {
@@ -166,6 +169,7 @@
                                      (outH + pass.block.height - 1) / pass.block.height,
                                      1);
         [encoder dispatchThreadgroups:groups threadsPerThreadgroup:pass.threads];
+        [encoder popDebugGroup];
     }
     [encoder endEncoding];
     return YES;
