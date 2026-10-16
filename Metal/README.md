@@ -43,6 +43,10 @@ Wall-clock time per frame, 300 pipelined frames, median of 3 runs:
 libplacebo's own per-pass GPU timers report about 0.5 ms at 1512x982 on MoltenVK, which
 would exceed the GPU's peak arithmetic rate by 9x, so only wall-clock time is compared.
 
+`tools/mpsgraph_cli.m` runs the same network through Apple's MPSGraph convolutions
+(float16, weights from `tools/export_weights.py`): 6.26 ms at 1512x982 against 6.05 ms for
+the Winograd shader in the same session, with matching output (59.5 dB, at most 2 codes).
+
 Per-pass profiling (`ARTCNN_PROFILE=1`) shows each 16->16 pass at about 1.05 ms whether it
 uses Winograd or direct convolution, so these passes are limited by moving the 16-channel
 activations through memory rather than by arithmetic. Fusing consecutive convolutions to
