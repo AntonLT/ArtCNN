@@ -240,13 +240,15 @@ def skip_kernel(index, p, w, b, conv0):
                       lambda g, v: f"staged[{g}][sy][sx] = load({prev}, px * 2 + int2({g & 1}, {g >> 1})) + ({v});")
     emit("    threadgroup_barrier(mem_flags::mem_threadgroup);")
     emit(f"    const uint x = tid % {BLOCK_W}, y = tid / {BLOCK_W};")
-    terms = [f"half4({', '.join(half(v) for v in b)})"]
+    # Accumulated in float: summing these 144 products in half is the largest rounding error
+    # of the whole network (59.5 dB against ONNX in half, 64.6 dB with float accumulation).
+    terms = [f"float4({', '.join(half(v) for v in b)})"]
     for ig in range(4):
         for ky in range(3):
             for kx in range(3):
                 cols = ["half4(" + ", ".join(half(w[i, ig * 4 + j, ky, kx]) for i in range(4)) + ")" for j in range(4)]
-                terms.append(f"half4x4({', '.join(cols)}) * staged[{ig}][y + {ky}][x + {kx}]")
-    emit("    half4 result = " + "\n        + ".join(terms) + ";")
+                terms.append(f"float4(half4x4({', '.join(cols)}) * staged[{ig}][y + {ky}][x + {kx}])")
+    emit("    const half4 result = half4(" + "\n        + ".join(terms) + ");")
     emit("    // Depth-to-space: channel 2dy + dx goes to output pixel (2x + dx, 2y + dy).")
     emit("    const half4 v = clamp(result, 0.0h, 1.0h);")
     emit("    const int2 o = (block + int2(x, y)) * 2;")

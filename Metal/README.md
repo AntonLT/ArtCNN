@@ -39,7 +39,7 @@ Wall-clock time per frame, 300 pipelined frames:
 
 | Implementation | 1280x800 | 1512x982 | 1920x1080 |
 |---|---|---|---|
-| Metal, shipped | 2.22 ms | 3.21 ms | 4.38 ms |
+| Metal, shipped | 2.22 ms | 3.22 ms | 4.38 ms |
 | Metal, direct translation | 4.51 ms | 6.23 ms | 9.00 ms |
 | libplacebo/MoltenVK, original GLSL | 4.40 ms | 6.37 ms | 8.82 ms |
 
@@ -64,6 +64,15 @@ GPU energy above idle is about 2.5x lower with Metal at every rate (Full HD: 138
 per frame against 343-377 mJ), more than the 1.7-1.8x difference in frame time. Whole-system
 power at 60 fps Full HD is 19-22 W against 33-35 W. These are IOReport estimates from the
 SoC's energy model; a paced loop in a real renderer may clock the GPU differently.
+
+## Skip-connection conv
+
+The last conv (16 -> 4) sums 144 products per output channel. Accumulating them in half
+precision was the largest rounding error in the network; accumulating in float lifts the
+match with ONNX from 59.6 dB to 69.5 dB on the 1600x1300 test image (values differing from
+ONNX after 8-bit rounding: 3.0% instead of 13.5%) for about 0.03 ms per frame. Running this
+conv as a Winograd kernel on `simdgroup_matrix` took 0.55 ms instead of 0.46 ms: with 4
+outputs the transforms and staging cost the same as a 16->16 layer while the products halve.
 
 ## First conv
 
