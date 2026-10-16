@@ -26,6 +26,16 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, readonly) NSUInteger passCount;
 
+// Recompute only blocks whose luma changed within the network's receptive field since the
+// previous frame; the rest keep last frame's results. Requires passing the same output
+// texture every frame (a different one, a size change or the first frame recomputes all).
+// Has no effect unless the shader declares a "// REUSE" line.
+@property (nonatomic) BOOL reuseUnchangedBlocks;
+
+// Fraction of mask cells recomputed in the last frame encoded with reuse, read back after
+// that frame's command buffer completed. For measurements only.
+- (double)lastDirtyFraction;
+
 - (nullable id<MTLTexture>)newOutputTextureForInputWidth:(NSUInteger)width height:(NSUInteger)height;
 
 @end

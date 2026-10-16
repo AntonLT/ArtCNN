@@ -66,6 +66,43 @@ static BOOL checkLaneLayout(id<MTLDevice> device, NSError **error)
     return YES;
 }
 
+// Reuse mask in two steps: artcnn_changed marks cells (one thread per pixel) whose luma
+// differs from the previous frame; artcnn_dilate marks a cell dirty if a changed cell lies
+// within the shader's dependency radius, rounded up to whole cells.
+static NSString *const kDirtyMaskSource =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "kernel void artcnn_changed(texture2d<half> luma [[texture(0)]], texture2d<half> prev [[texture(1)]],\n"
+     "    device atomic_uint *changed [[buffer(0)]], constant uint4 &cfg [[buffer(1)]],\n"
+     "    uint2 gid [[thread_position_in_grid]])\n"
+     "{\n"
+     "    // cfg = (cells_x, cells_y, cell_w, cell_h)\n"
+     "    if (gid.x >= luma.get_width() || gid.y >= luma.get_height()) {\n"
+     "        return;\n"
+     "    }\n"
+     "    if (luma.read(gid).x != prev.read(gid).x) {\n"
+     "        atomic_store_explicit(&changed[(gid.y / cfg.w) * cfg.x + gid.x / cfg.z], 1u, memory_order_relaxed);\n"
+     "    }\n"
+     "}\n"
+     "kernel void artcnn_dilate(device const uint *changed [[buffer(0)]], device uchar *dirty [[buffer(1)]],\n"
+     "    constant uint4 &cfg [[buffer(2)]], uint2 gid [[thread_position_in_grid]])\n"
+     "{\n"
+     "    // cfg = (cells_x, cells_y, reach_x, reach_y) in cells\n"
+     "    if (gid.x >= cfg.x || gid.y >= cfg.y) {\n"
+     "        return;\n"
+     "    }\n"
+     "    bool any = false;\n"
+     "    for (int dy = -int(cfg.w); dy <= int(cfg.w); dy++) {\n"
+     "        for (int dx = -int(cfg.z); dx <= int(cfg.z); dx++) {\n"
+     "            const int2 c = int2(gid) + int2(dx, dy);\n"
+     "            if (all(c >= 0) && c.x < int(cfg.x) && c.y < int(cfg.y)) {\n"
+     "                any |= changed[c.y * cfg.x + c.x] != 0;\n"
+     "            }\n"
+     "        }\n"
+     "    }\n"
+     "    dirty[gid.y * cfg.x + gid.x] = any;\n"
+     "}\n";
+
 @implementation ArtCNNMetal {
     id<MTLDevice> _device;
     NSArray<ArtCNNPass *> *_passes;
@@ -73,6 +110,20 @@ static BOOL checkLaneLayout(id<MTLDevice> device, NSError **error)
     NSUInteger _width;
     NSUInteger _height;
     BOOL _float32;
+    // Frame-to-frame reuse (see reuseUnchangedBlocks).
+    NSUInteger _reuseRadiusX;
+    NSUInteger _reuseRadiusY;
+    MTLSize _cell;
+    id<MTLComputePipelineState> _changedPipeline;
+    id<MTLComputePipelineState> _dilatePipeline;
+    id<MTLBuffer> _changed;
+    id<MTLBuffer> _dirty;
+    uint32_t _cellsX;
+    uint32_t _cellsY;
+    id<MTLTexture> _previousLuma;
+    __weak id<MTLTexture> _previousOutput;
+    BOOL _haveHistory;
+    BOOL _maskAllDirty;  // the mask is known to be all ones
 }
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device source:(NSString *)source error:(NSError **)error
@@ -127,6 +178,25 @@ static BOOL checkLaneLayout(id<MTLDevice> device, NSError **error)
     }
     _passes = passes;
     _float32 = [source containsString:@"\n// PRECISION float32\n"];
+
+    NSTextCheckingResult *reuse = [[NSRegularExpression regularExpressionWithPattern:@"^// REUSE radius=(\\d+)x(\\d+) cell=(\\d+)x(\\d+)"
+                                                                            options:NSRegularExpressionAnchorsMatchLines
+                                                                              error:nil]
+                                   firstMatchInString:source options:0 range:NSMakeRange(0, source.length)];
+    if (reuse) {
+        _reuseRadiusX = [source substringWithRange:[reuse rangeAtIndex:1]].integerValue;
+        _reuseRadiusY = [source substringWithRange:[reuse rangeAtIndex:2]].integerValue;
+        _cell = MTLSizeMake([source substringWithRange:[reuse rangeAtIndex:3]].integerValue,
+                            [source substringWithRange:[reuse rangeAtIndex:4]].integerValue, 1);
+        id<MTLLibrary> maskLibrary = [device newLibraryWithSource:kDirtyMaskSource options:nil error:error];
+        id<MTLFunction> changed = [maskLibrary newFunctionWithName:@"artcnn_changed"];
+        id<MTLFunction> dilate = [maskLibrary newFunctionWithName:@"artcnn_dilate"];
+        _changedPipeline = changed ? [device newComputePipelineStateWithFunction:changed error:error] : nil;
+        _dilatePipeline = dilate ? [device newComputePipelineStateWithFunction:dilate error:error] : nil;
+        if (!_changedPipeline || !_dilatePipeline) {
+            return nil;
+        }
+    }
     return self;
 }
 
@@ -184,7 +254,28 @@ static BOOL checkLaneLayout(id<MTLDevice> device, NSError **error)
     }
     _width = width;
     _height = height;
+
+    // The mask is all ones unless reuse finds clean cells, so shaders that read it work either way.
+    NSUInteger cellW = _cell.width ? _cell.width : 16, cellH = _cell.height ? _cell.height : 8;
+    _cellsX = (uint32_t)((width + cellW - 1) / cellW);
+    _cellsY = (uint32_t)((height + cellH - 1) / cellH);
+    _dirty = [_device newBufferWithLength:_cellsX * _cellsY options:MTLResourceStorageModeShared];
+    _changed = [_device newBufferWithLength:_cellsX * _cellsY * sizeof(uint32_t) options:MTLResourceStorageModePrivate];
+    memset(_dirty.contents, 1, _dirty.length);
+    _maskAllDirty = YES;
+    _previousLuma = nil;
+    _haveHistory = NO;
     return YES;
+}
+
+- (double)lastDirtyFraction
+{
+    const uint8_t *d = _dirty.contents;
+    NSUInteger n = 0;
+    for (NSUInteger i = 0; i < _dirty.length; i++) {
+        n += d[i] != 0;
+    }
+    return _dirty.length ? (double)n / _dirty.length : 1.0;
 }
 
 - (NSUInteger)passCount
@@ -208,7 +299,39 @@ static BOOL checkLaneLayout(id<MTLDevice> device, NSError **error)
         return NO;
     }
 
+    BOOL fullFrame = range.location == 0 && range.length == _passes.count;
+    BOOL reuse = _reuseUnchangedBlocks && _changedPipeline && fullFrame && _haveHistory &&
+                 output == _previousOutput && _previousLuma.pixelFormat == input.pixelFormat;
+
+    if (fullFrame && (reuse || !_maskAllDirty)) {
+        // Filled on the GPU timeline so frames still in flight keep the mask they were encoded with.
+        id<MTLBlitCommandEncoder> fill = [commandBuffer blitCommandEncoder];
+        if (reuse) {
+            [fill fillBuffer:_changed range:NSMakeRange(0, _changed.length) value:0];
+        } else {
+            [fill fillBuffer:_dirty range:NSMakeRange(0, _dirty.length) value:1];
+        }
+        [fill endEncoding];
+        _maskAllDirty = !reuse;
+    }
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (reuse) {
+        uint32_t cellCfg[4] = { _cellsX, _cellsY, (uint32_t)_cell.width, (uint32_t)_cell.height };
+        [encoder setComputePipelineState:_changedPipeline];
+        [encoder setTexture:input atIndex:0];
+        [encoder setTexture:_previousLuma atIndex:1];
+        [encoder setBuffer:_changed offset:0 atIndex:0];
+        [encoder setBytes:cellCfg length:sizeof(cellCfg) atIndex:1];
+        [encoder dispatchThreads:MTLSizeMake(input.width, input.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+        uint32_t reach[4] = { _cellsX, _cellsY,
+                              (uint32_t)((_reuseRadiusX + _cell.width - 1) / _cell.width),
+                              (uint32_t)((_reuseRadiusY + _cell.height - 1) / _cell.height) };
+        [encoder setComputePipelineState:_dilatePipeline];
+        [encoder setBuffer:_changed offset:0 atIndex:0];
+        [encoder setBuffer:_dirty offset:0 atIndex:1];
+        [encoder setBytes:reach length:sizeof(reach) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(_cellsX, _cellsY, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+    }
     for (ArtCNNPass *pass in [_passes subarrayWithRange:range]) {
         [encoder pushDebugGroup:pass.name];
         [encoder setComputePipelineState:pass.pipeline];
@@ -218,6 +341,8 @@ static BOOL checkLaneLayout(id<MTLDevice> device, NSError **error)
         }
         id<MTLTexture> target = [pass.save isEqualToString:@"OUTPUT"] ? output : _textures[pass.save];
         [encoder setTexture:target atIndex:index];
+        [encoder setBuffer:_dirty offset:0 atIndex:0];
+        [encoder setBytes:&_cellsX length:sizeof(_cellsX) atIndex:1];
 
         // Block sizes are in the pass's GLSL output coordinates (input size times scale).
         NSUInteger outW = (NSUInteger)(input.width * pass.scaleX), outH = (NSUInteger)(input.height * pass.scaleY);
@@ -228,6 +353,23 @@ static BOOL checkLaneLayout(id<MTLDevice> device, NSError **error)
         [encoder popDebugGroup];
     }
     [encoder endEncoding];
+
+    if (_reuseUnchangedBlocks && _changedPipeline && fullFrame) {
+        if (!_previousLuma || _previousLuma.pixelFormat != input.pixelFormat) {
+            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:input.pixelFormat
+                                                                                            width:input.width
+                                                                                           height:input.height
+                                                                                        mipmapped:NO];
+            desc.usage = MTLTextureUsageShaderRead;
+            desc.storageMode = MTLStorageModePrivate;
+            _previousLuma = [_device newTextureWithDescriptor:desc];
+        }
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        [blit copyFromTexture:input toTexture:_previousLuma];
+        [blit endEncoding];
+        _previousOutput = output;
+        _haveHistory = YES;
+    }
     return YES;
 }
 

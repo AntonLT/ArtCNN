@@ -36,6 +36,7 @@ static inline void store(texture2d_array<half, access::write> t, int2 p, half4 v
         t.write(v, uint2(q), uint((p.y & 1) * 2 + (p.x & 1)));
     }
 }
+// REUSE radius=22x12 cell=16x8
 // PASS 0 binds=LUMA save=conv2d_1 block=64x16 threads=128x1 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D-1-ReLU)
 // PASS 1 binds=conv2d_1 save=conv2d_2 block=64x16 threads=128x1 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D-2-ReLU)
 // PASS 2 binds=conv2d_2 save=conv2d_3 block=64x16 threads=128x1 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D-3-ReLU)
@@ -49,11 +50,17 @@ constant half winograd_b0[16] = {0.0224940088, 0.0106882406, 0.113071755, 0.0143
 // ArtCNN C4F16 DS (Conv2D-1-ReLU) (Winograd F(4, 3) x F(2, 3), tiles in registers, products on simdgroup_matrix)
 kernel void artcnn_pass0(texture2d<half> LUMA [[texture(0)]],
     texture2d_array<half, access::write> out_image [[texture(1)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 2;
+    if ((tgid.x * 2 + 0 >= cells_x || !dirty[cell + 0]) && (tgid.x * 2 + 1 >= cells_x || !dirty[cell + 1])) {
+        return;  // nothing within the receptive field changed since the last frame
+    }
     threadgroup half4 staged[4][10][2][17];
     const int2 block = int2(tgid) * int2(32, 8);
     threadgroup half luma[12][36];
@@ -921,11 +928,17 @@ constant half winograd_b1[16] = {0.0442771874, -0.00376968505, 0.0145656988, 0.0
 // ArtCNN C4F16 DS (Conv2D-2-ReLU) (Winograd F(4, 3) x F(2, 3), tiles in registers, products on simdgroup_matrix)
 kernel void artcnn_pass1(texture2d_array<half> conv2d_1 [[texture(0)]],
     texture2d_array<half, access::write> out_image [[texture(1)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 2;
+    if ((tgid.x * 2 + 0 >= cells_x || !dirty[cell + 0]) && (tgid.x * 2 + 1 >= cells_x || !dirty[cell + 1])) {
+        return;  // nothing within the receptive field changed since the last frame
+    }
     threadgroup half4 staged[4][10][2][17];
     const int2 block = int2(tgid) * int2(32, 8);
     for (uint i = tid; i < 1360; i += 128) {
@@ -1784,11 +1797,17 @@ constant half winograd_b2[16] = {0.0277781356, 0.0038762365, 0.00601124065, 0.00
 // ArtCNN C4F16 DS (Conv2D-3-ReLU) (Winograd F(4, 3) x F(2, 3), tiles in registers, products on simdgroup_matrix)
 kernel void artcnn_pass2(texture2d_array<half> conv2d_2 [[texture(0)]],
     texture2d_array<half, access::write> out_image [[texture(1)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 2;
+    if ((tgid.x * 2 + 0 >= cells_x || !dirty[cell + 0]) && (tgid.x * 2 + 1 >= cells_x || !dirty[cell + 1])) {
+        return;  // nothing within the receptive field changed since the last frame
+    }
     threadgroup half4 staged[4][10][2][17];
     const int2 block = int2(tgid) * int2(32, 8);
     for (uint i = tid; i < 1360; i += 128) {
@@ -2647,11 +2666,17 @@ constant half winograd_b3[16] = {-0.00842655543, -0.00608674996, 0.0153720994, -
 // ArtCNN C4F16 DS (Conv2D-4-ReLU) (Winograd F(4, 3) x F(2, 3), tiles in registers, products on simdgroup_matrix)
 kernel void artcnn_pass3(texture2d_array<half> conv2d_3 [[texture(0)]],
     texture2d_array<half, access::write> out_image [[texture(1)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 2;
+    if ((tgid.x * 2 + 0 >= cells_x || !dirty[cell + 0]) && (tgid.x * 2 + 1 >= cells_x || !dirty[cell + 1])) {
+        return;  // nothing within the receptive field changed since the last frame
+    }
     threadgroup half4 staged[4][10][2][17];
     const int2 block = int2(tgid) * int2(32, 8);
     for (uint i = tid; i < 1360; i += 128) {
@@ -3510,11 +3535,17 @@ constant half winograd_b4[16] = {0.0139502799, 0.00658210227, 0.0121519631, -0.0
 // ArtCNN C4F16 DS (Conv2D-5) (Winograd F(4, 3) x F(2, 3), tiles in registers, products on simdgroup_matrix)
 kernel void artcnn_pass4(texture2d_array<half> conv2d_4 [[texture(0)]],
     texture2d_array<half, access::write> out_image [[texture(1)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 2;
+    if ((tgid.x * 2 + 0 >= cells_x || !dirty[cell + 0]) && (tgid.x * 2 + 1 >= cells_x || !dirty[cell + 1])) {
+        return;  // nothing within the receptive field changed since the last frame
+    }
     threadgroup half4 staged[4][10][2][17];
     const int2 block = int2(tgid) * int2(32, 8);
     for (uint i = tid; i < 1360; i += 128) {
@@ -4363,9 +4394,14 @@ kernel void artcnn_pass4(texture2d_array<half> conv2d_4 [[texture(0)]],
 kernel void artcnn_pass5(texture2d<half> LUMA [[texture(0)]],
     texture2d_array<half> conv2d_5 [[texture(1)]],
     texture2d<half, access::write> out_image [[texture(2)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
+    if (!dirty[tgid.y * cells_x + tgid.x]) {
+        return;  // nothing within the receptive field changed since the last frame
+    }
     threadgroup half4 staged[4][10][18];
     const int2 block = int2(tgid) * int2(16, 8);
     threadgroup half luma[12][20];

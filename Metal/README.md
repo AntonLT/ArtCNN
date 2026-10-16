@@ -65,6 +65,37 @@ per frame against 343-377 mJ), more than the 1.7-1.8x difference in frame time. 
 power at 60 fps Full HD is 19-22 W against 33-35 W. These are IOReport estimates from the
 SoC's energy model; a paced loop in a real renderer may clock the GPU differently.
 
+## Reusing unchanged blocks between frames
+
+With `reuseUnchangedBlocks` on, `ArtCNNMetal` keeps a copy of the previous frame's luma and,
+before the layers run, marks 16x8 cells whose luma changed (one thread per pixel), then
+grows that mark by the shader's dependency radius rounded up to whole cells. Every layer's
+threadgroup returns at once when its cells are clean, so its block keeps last frame's values
+in the persistent intermediate and output textures. The caller must pass the same output
+texture every frame; a different one, a size change or the first frame recomputes all.
+
+The dependency radius is declared by the shader (`// REUSE radius=22x12`). In exact
+arithmetic an output depends on luma within 7 pixels (one per 3x3 conv), but a Winograd
+tile's rounding depends on its whole input window, so each F(4, 3) x F(2, 3) layer reaches
+4 pixels across and 2 down. With a radius of 7 the output differed from a full computation
+in 22 pixels by one rounding step; with 22x12 it is byte-identical.
+
+`ARTCNN_REUSE_TEST=1` checks this: frame B is frame A with a centered rectangle inverted;
+reuse output after A then B must equal B computed in full. 1512x982, alternating A/B frames:
+
+| Image changed | Cells recomputed | Time per frame | Output |
+|---|---|---|---|
+| 0% | 0% | 0.20 ms | identical |
+| 2% | 3.4% | 0.31 ms | identical |
+| 10% | 12.9% | 0.69 ms | identical |
+| 30% | 35.1% | 1.39 ms | identical |
+| 100% | 100% | 3.33 ms | identical |
+
+Without reuse a frame takes 3.28 ms, 1.5% more than a shader without the mask check
+(3.23 ms). Decoded video only repeats pixels exactly where the encoder skipped a block, so the
+savings depend on the stream: static menus, desktop use and paused scenes benefit, and noisy
+or fast-moving content falls back to full cost.
+
 ## Skip-connection conv
 
 The last conv (16 -> 4) sums 144 products per output channel. Accumulating them in half

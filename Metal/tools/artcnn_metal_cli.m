@@ -50,6 +50,79 @@ int main(int argc, const char *argv[])
         id<MTLTexture> output = [artcnn newOutputTextureForInputWidth:width height:height];
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
+        // ARTCNN_REUSE_TEST=1: frame B is frame A with a rectangle inverted. With reuse on, A then
+        // B must give byte-identical output to B computed in full; then time alternating A/B
+        // frames for several rectangle sizes.
+        if (getenv("ARTCNN_REUSE_TEST")) {
+            NSUInteger outW = width * 2, outH = height * 2;
+            NSData * (^readback)(id<MTLTexture>) = ^(id<MTLTexture> texture) {
+                id<MTLBuffer> buf = [device newBufferWithLength:outW * outH * 2 options:MTLResourceStorageModeShared];
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(outW, outH, 1) toBuffer:buf destinationOffset:0
+               destinationBytesPerRow:outW * 2 destinationBytesPerImage:outW * outH * 2];
+                [blit endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                return [NSData dataWithBytes:buf.contents length:buf.length];
+            };
+            void (^run)(ArtCNNMetal *, id<MTLTexture>, id<MTLTexture>) = ^(ArtCNNMetal *net, id<MTLTexture> in, id<MTLTexture> out) {
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                [net encodeToCommandBuffer:cb input:in output:out];
+                [cb commit];
+                [cb waitUntilCompleted];
+            };
+            for (NSNumber *fraction in @[@0.0, @0.02, @0.1, @0.3, @1.0]) {
+                // B: invert a centered rectangle covering `fraction` of the image.
+                __fp16 *pixels = malloc(width * height * sizeof(__fp16));
+                const float *a = inputData.bytes;
+                NSUInteger rw = (NSUInteger)(width * sqrt(fraction.doubleValue)), rh = (NSUInteger)(height * sqrt(fraction.doubleValue));
+                NSUInteger x0 = (width - rw) / 2, y0 = (height - rh) / 2;
+                for (NSUInteger y = 0; y < height; y++) {
+                    for (NSUInteger x = 0; x < width; x++) {
+                        BOOL inside = x >= x0 && x < x0 + rw && y >= y0 && y < y0 + rh;
+                        pixels[y * width + x] = (__fp16)(inside ? 1.0f - a[y * width + x] : a[y * width + x]);
+                    }
+                }
+                id<MTLTexture> inputB = [device newTextureWithDescriptor:inDesc];
+                [inputB replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:pixels bytesPerRow:width * sizeof(__fp16)];
+                free(pixels);
+
+                ArtCNNMetal *reuse = [[ArtCNNMetal alloc] initWithDevice:device source:source error:&error];
+                reuse.reuseUnchangedBlocks = YES;
+                id<MTLTexture> out = [reuse newOutputTextureForInputWidth:width height:height];
+                run(reuse, input, out);
+                run(reuse, inputB, out);
+                double dirty = [reuse lastDirtyFraction];
+                NSData *got = readback(out);
+
+                ArtCNNMetal *full = [[ArtCNNMetal alloc] initWithDevice:device source:source error:&error];
+                id<MTLTexture> fullOut = [full newOutputTextureForInputWidth:width height:height];
+                run(full, inputB, fullOut);
+                NSData *want = readback(fullOut);
+                BOOL same = [got isEqualToData:want];
+                if (!same && getenv("ARTCNN_REUSE_DUMP")) {
+                    [got writeToFile:@"/tmp/reuse_got.f16" atomically:NO];
+                    [want writeToFile:@"/tmp/reuse_want.f16" atomically:NO];
+                }
+
+                int n = 200;
+                CFTimeInterval start = CACurrentMediaTime();
+                id<MTLCommandBuffer> last = nil;
+                for (int i = 0; i < n; i++) {
+                    last = [queue commandBuffer];
+                    [reuse encodeToCommandBuffer:last input:(i & 1) ? input : inputB output:out];
+                    [last commit];
+                }
+                [last waitUntilCompleted];
+                printf("changed %4.0f%% of image: %5.1f%% of cells recomputed, output %s full computation, %.3f ms per frame\n",
+                       fraction.doubleValue * 100, dirty * 100, same ? "identical to" : "DIFFERS from",
+                       (CACurrentMediaTime() - start) * 1000.0 / n);
+            }
+            return 0;
+        }
+
         // ARTCNN_CAPTURE=path.gputrace saves one full frame as a Metal GPU trace for Xcode
         // (needs MTL_CAPTURE_ENABLED=1). Xcode shows registers, spills and occupancy per kernel.
         if (getenv("ARTCNN_CAPTURE")) {
