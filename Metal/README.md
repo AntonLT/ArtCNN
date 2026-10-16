@@ -80,7 +80,10 @@ One 8 KB threadgroup buffer serves both the staged input and the transformed til
 occupancy fell to 12% and the layer took 1.21 ms instead of 0.60 ms. Weight tiles are
 filled per lane from a constant table using the lane-to-element layout of `simdgroup_matrix`,
 measured on an M4 Pro: lane l holds row `(q & 4) + (l / 2) % 4`, columns
-`(q & 2) * 2 + (l % 2) * 2` and the next one, with q = l / 4.
+`(q & 2) * 2 + (l % 2) * 2` and the next one, with q = l / 4. Metal does not document this
+layout (MLX relies on the same one), so `ArtCNNMetal` checks it on the device at startup and
+fails initialization if it differs. Loading the tiles with `simdgroup_load` through
+threadgroup memory instead is layout-independent but took 5.2 ms per frame instead of 3.66.
 
 Per-layer counters before and after (1512x982):
 

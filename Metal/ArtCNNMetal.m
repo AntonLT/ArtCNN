@@ -14,6 +14,58 @@
 @implementation ArtCNNPass
 @end
 
+// The Winograd kernels fill weight tiles per lane, assuming lane l holds elements
+// (r, c) and (r, c + 1) of an 8x8 simdgroup matrix with q = l / 4, r = (q & 4) + (l / 2) % 4,
+// c = (q & 2) * 2 + (l % 2) * 2. Metal does not document this layout, so it is checked on
+// the device before the shader is used.
+static NSString *const kLaneLayoutCheck =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "kernel void check_lane_layout(device uint *bad [[buffer(0)]], ushort lane [[thread_index_in_simdgroup]])\n"
+     "{\n"
+     "    threadgroup half m[64];\n"
+     "    simdgroup_half8x8 a = make_filled_simdgroup_matrix<half, 8, 8>(-1.0h);\n"
+     "    const uint q = lane / 4;\n"
+     "    const uint r = (q & 4) + (lane / 2) % 4, c = (q & 2) * 2 + (lane % 2) * 2;\n"
+     "    a.thread_elements()[0] = half(r * 8 + c);\n"
+     "    a.thread_elements()[1] = half(r * 8 + c + 1);\n"
+     "    simdgroup_store(a, m, 8);\n"
+     "    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "    for (uint i = lane; i < 64; i += 32) {\n"
+     "        if (m[i] != half(i)) {\n"
+     "            atomic_fetch_add_explicit((device atomic_uint *)bad, 1, memory_order_relaxed);\n"
+     "        }\n"
+     "    }\n"
+     "}\n";
+
+static BOOL checkLaneLayout(id<MTLDevice> device, NSError **error)
+{
+    id<MTLLibrary> library = [device newLibraryWithSource:kLaneLayoutCheck options:nil error:error];
+    id<MTLFunction> function = [library newFunctionWithName:@"check_lane_layout"];
+    id<MTLComputePipelineState> pipeline = function ? [device newComputePipelineStateWithFunction:function error:error] : nil;
+    if (!pipeline) {
+        return NO;
+    }
+    id<MTLBuffer> bad = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    *(uint32_t *)bad.contents = 0;
+    id<MTLCommandBuffer> commandBuffer = [[device newCommandQueue] commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:bad offset:0 atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    if (*(uint32_t *)bad.contents != 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ArtCNNMetal" code:2 userInfo:@{
+                NSLocalizedDescriptionKey: @"simdgroup_matrix lane layout differs from the one the shader assumes"}];
+        }
+        return NO;
+    }
+    return YES;
+}
+
 @implementation ArtCNNMetal {
     id<MTLDevice> _device;
     NSArray<ArtCNNPass *> *_passes;
@@ -30,6 +82,10 @@
     }
     _device = device;
     _textures = [NSMutableDictionary dictionary];
+
+    if ([source containsString:@"thread_elements()"] && !checkLaneLayout(device, error)) {
+        return nil;
+    }
 
     MTLCompileOptions *options = [MTLCompileOptions new];
     options.languageVersion = MTLLanguageVersion4_1;
