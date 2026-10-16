@@ -3,7 +3,7 @@
 @interface ArtCNNPass : NSObject
 @property (nonatomic) id<MTLComputePipelineState> pipeline;
 @property (nonatomic) NSArray<NSString *> *binds;
-@property (nonatomic) NSString *save;
+@property (nonatomic) NSArray<NSString *> *saves;
 @property (nonatomic) MTLSize block;
 @property (nonatomic) MTLSize threads;
 @property (nonatomic) float scaleX;
@@ -124,6 +124,8 @@ static NSString *const kDirtyMaskSource =
     __weak id<MTLTexture> _previousOutput;
     BOOL _haveHistory;
     BOOL _maskAllDirty;  // the mask is known to be all ones
+    NSUInteger _outputScale;
+    MTLPixelFormat _outputFormat;
 }
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device source:(NSString *)source error:(NSError **)error
@@ -162,7 +164,7 @@ static NSString *const kDirtyMaskSource =
         }
         pass.name = [NSString stringWithFormat:@"%@: %@", name, [source substringWithRange:NSMakeRange(NSMaxRange(m.range), [source lineRangeForRange:m.range].location + [source lineRangeForRange:m.range].length - NSMaxRange(m.range))]];
         pass.binds = [group(2) componentsSeparatedByString:@","];
-        pass.save = group(3);
+        pass.saves = [group(3) componentsSeparatedByString:@","];
         pass.block = MTLSizeMake(group(4).integerValue, group(5).integerValue, 1);
         pass.threads = MTLSizeMake(group(6).integerValue, group(7).integerValue, 1);
         pass.scaleX = group(8).floatValue;
@@ -178,6 +180,13 @@ static NSString *const kDirtyMaskSource =
     }
     _passes = passes;
     _float32 = [source containsString:@"\n// PRECISION float32\n"];
+    // Default output: the luma doubled (ArtCNN). Shaders can declare another one.
+    _outputScale = 2;
+    _outputFormat = _float32 ? MTLPixelFormatR32Float : MTLPixelFormatR16Float;
+    if ([source containsString:@"\n// OUTPUT scale=1 format=rgba16f\n"]) {
+        _outputScale = 1;
+        _outputFormat = MTLPixelFormatRGBA16Float;
+    }
 
     NSTextCheckingResult *reuse = [[NSRegularExpression regularExpressionWithPattern:@"^// REUSE radius=(\\d+)x(\\d+) cell=(\\d+)x(\\d+)"
                                                                             options:NSRegularExpressionAnchorsMatchLines
@@ -225,9 +234,7 @@ static NSString *const kDirtyMaskSource =
 
 - (id<MTLTexture>)newOutputTextureForInputWidth:(NSUInteger)width height:(NSUInteger)height
 {
-    return [self newTextureWithFormat:_float32 ? MTLPixelFormatR32Float : MTLPixelFormatR16Float
-                                width:width * 2
-                               height:height * 2];
+    return [self newTextureWithFormat:_outputFormat width:width * _outputScale height:height * _outputScale];
 }
 
 - (BOOL)prepareForWidth:(NSUInteger)width height:(NSUInteger)height
@@ -237,7 +244,8 @@ static NSString *const kDirtyMaskSource =
     }
     [_textures removeAllObjects];
     for (ArtCNNPass *pass in _passes) {
-        if ([pass.save isEqualToString:@"OUTPUT"]) {
+        for (NSString *save in pass.saves) {
+        if ([save isEqualToString:@"OUTPUT"]) {
             continue;
         }
         // A pass at 2x scale produces 16 channels, stored as 4 slices at input size;
@@ -250,7 +258,8 @@ static NSString *const kDirtyMaskSource =
         if (!texture) {
             return NO;
         }
-        _textures[pass.save] = texture;
+        _textures[save] = texture;
+        }
     }
     _width = width;
     _height = height;
@@ -337,10 +346,12 @@ static NSString *const kDirtyMaskSource =
         [encoder setComputePipelineState:pass.pipeline];
         NSUInteger index = 0;
         for (NSString *bind in pass.binds) {
-            [encoder setTexture:[bind isEqualToString:@"LUMA"] ? input : _textures[bind] atIndex:index++];
+            BOOL isInput = [bind isEqualToString:@"LUMA"] || [bind isEqualToString:@"MAIN"];
+            [encoder setTexture:isInput ? input : _textures[bind] atIndex:index++];
         }
-        id<MTLTexture> target = [pass.save isEqualToString:@"OUTPUT"] ? output : _textures[pass.save];
-        [encoder setTexture:target atIndex:index];
+        for (NSString *save in pass.saves) {
+            [encoder setTexture:[save isEqualToString:@"OUTPUT"] ? output : _textures[save] atIndex:index++];
+        }
         [encoder setBuffer:_dirty offset:0 atIndex:0];
         [encoder setBytes:&_cellsX length:sizeof(_cellsX) atIndex:1];
 

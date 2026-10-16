@@ -232,3 +232,36 @@ tiles: indexed with loop variables, a layer took 11 ms instead of 0.98 ms.
 
 Fusion removes a write and a read per pair but recomputes about 1.4x of the first layer
 and leaves lanes idle, which costs more than the 0.39 ms it saves.
+
+## Anime4K Restore CNN on Metal
+
+`anime4k.py` generates Metal kernels for Anime4K v4 Restore CNN shaders
+(https://github.com/bloc97/Anime4K, MIT), which remove compression artifacts and blur at the
+input resolution on RGB. `anime4k_weights.py` parses the GLSL: each layer's two passes of 4
+outputs become one kernel with 8 outputs, inputs are read through CReLU (max(+-x, 0)) with
+clamp-to-edge like libplacebo's texOff, and the last layer adds the input and clamps to
+[0, 1] as libplacebo's output does. The 16 -> 8 layers run as F(4, 3) x F(2, 3) Winograd with
+tiles in registers on `simdgroup_matrix`: the two input matrices are relu(x) and relu(-x) of
+the 8 stored channels, so each lane reads only its own 2 channels.
+
+```
+python anime4k.py path/to/Anime4K_Restore_CNN_L.glsl Anime4K_Restore_CNN_L.metal
+ARTCNN_RGB=1 build/artcnn_metal_cli Anime4K_Restore_CNN_L.metal rgb.f32 W H out.f32 200
+PLBENCH_RGB=1 build/plbench path/to/Anime4K_Restore_CNN_L.glsl rgb.f32 W H out.f32 200
+```
+
+Restore L on `Images/artcnn_examples.png` (1600x1300 RGB) against a float64 NumPy forward pass
+of the parsed weights (outputs clamped to [0, 1]):
+
+| Implementation | PSNR | Max error (8-bit codes) |
+|---|---|---|
+| Metal, direct kernels | 74.7 dB | 1 |
+| Metal, Winograd (shipped) | 73.3 dB | 2 |
+| Original GLSL via libplacebo/MoltenVK | 72.8 dB | 1 |
+
+Time per frame on an M4 Pro, 200 pipelined frames:
+
+| Input | Metal Winograd | Metal direct | libplacebo/MoltenVK |
+|---|---|---|---|
+| 1920x1080 | 1.94 ms | 5.27 ms | 7.65 ms |
+| 3024x1964 | 5.50 ms | 14.85 ms | 21.3 ms |

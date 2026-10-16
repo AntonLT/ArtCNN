@@ -4,7 +4,8 @@
 // Moonlight's PlVkRenderer does, on a luma-only frame with neutral chroma. Writes the
 // doubled luma and reports libplacebo's GPU timer results for the ArtCNN passes.
 // With "none" as the shader it renders 1:1 without hooks, which measures the
-// color path of this harness itself.
+// color path of this harness itself. PLBENCH_RGB=1 reads interleaved float32 RGB instead
+// of luma, renders an RGB frame 1:1 (for shaders hooking MAIN) and writes RGB.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,10 +90,11 @@ int main(int argc, char **argv)
     }
     size_t shader_len, input_len;
     int identity = strcmp(argv[1], "none") == 0;
-    int scale = identity ? 1 : 2;
+    int rgb = getenv("PLBENCH_RGB") != NULL;
+    int scale = identity || rgb ? 1 : 2;
     char *shader_src = identity ? NULL : read_file(argv[1], &shader_len);
     float *luma = (float *)read_file(argv[2], &input_len);
-    if ((!identity && !shader_src) || !luma || input_len != (size_t)w * h * sizeof(float)) {
+    if ((!identity && !shader_src) || !luma || input_len != (size_t)w * h * (rgb ? 3 : 1) * sizeof(float)) {
         fprintf(stderr, "bad shader or input\n");
         return 2;
     }
@@ -147,6 +149,20 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    pl_tex rgb_tex = NULL;
+    if (rgb) {
+        uint16_t *rgba = malloc((size_t)w * h * 4 * 2);
+        for (int i = 0; i < w * h; i++) {
+            for (int c = 0; c < 4; c++) {
+                _Float16 v = (_Float16)(c < 3 ? luma[i * 3 + c] : 1.0f);
+                memcpy(&rgba[i * 4 + c], &v, 2);
+            }
+        }
+        pl_fmt rgba16 = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16, PL_FMT_CAP_SAMPLEABLE);
+        rgb_tex = pl_tex_create(gpu, pl_tex_params(.w = w, .h = h, .format = rgba16, .sampleable = true,
+                                                   .host_writable = true, .initial_data = rgba));
+        free(rgba);
+    }
     struct pl_frame image = {
         .num_planes = 2,
         .planes = {
@@ -157,6 +173,14 @@ int main(int argc, char **argv)
         .color = pl_color_space_bt709,
     };
     pl_chroma_location_offset(PL_CHROMA_LEFT, &image.planes[1].shift_x, &image.planes[1].shift_y);
+    if (rgb) {
+        image = (struct pl_frame) {
+            .num_planes = 1,
+            .planes = { { .texture = rgb_tex, .components = 4, .component_mapping = { 0, 1, 2, 3 } } },
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_bt709,
+        };
+    }
     struct pl_frame target = {
         .num_planes = 1,
         .planes = { { .texture = out_tex, .components = 4, .component_mapping = { 0, 1, 2, 3 } } },
@@ -231,19 +255,22 @@ int main(int argc, char **argv)
         batch_ms = (now_ms() - start) / iterations;
     }
 
-    float *out = malloc(out_pixels * sizeof(float));
+    int out_ch = rgb ? 3 : 1;
+    float *out = malloc(out_pixels * out_ch * sizeof(float));
     uint16_t *rgba_half = malloc(out_pixels * 4 * 2);
     if (!pl_tex_download(gpu, pl_tex_transfer_params(.tex = out_tex, .ptr = rgba_half))) {
         fprintf(stderr, "download failed\n");
         return 1;
     }
     for (size_t i = 0; i < out_pixels; i++) {
-        _Float16 v;
-        memcpy(&v, &rgba_half[i * 4], 2);
-        out[i] = (float)v;
+        for (int c = 0; c < out_ch; c++) {
+            _Float16 v;
+            memcpy(&v, &rgba_half[i * 4 + c], 2);
+            out[i * out_ch + c] = (float)v;
+        }
     }
     FILE *f = fopen(argv[5], "wb");
-    fwrite(out, sizeof(float), out_pixels, f);
+    fwrite(out, sizeof(float), out_pixels * out_ch, f);
     fclose(f);
 
     if (iterations > 0) {
@@ -257,6 +284,7 @@ int main(int argc, char **argv)
     pl_tex_destroy(gpu, &y_tex);
     pl_tex_destroy(gpu, &c_tex);
     pl_tex_destroy(gpu, &out_tex);
+    pl_tex_destroy(gpu, &rgb_tex);
     if (hook) {
         pl_mpv_user_shader_destroy(&hook);
     }

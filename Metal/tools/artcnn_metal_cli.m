@@ -18,7 +18,10 @@ int main(int argc, const char *argv[])
         NSData *inputData = [NSData dataWithContentsOfFile:@(argv[2])];
         NSUInteger width = strtoul(argv[3], NULL, 10), height = strtoul(argv[4], NULL, 10);
         int iterations = argc > 6 ? atoi(argv[6]) : 0;
-        if (!source || inputData.length != width * height * sizeof(float)) {
+        // ARTCNN_RGB=1: interleaved float32 RGB in and out at the input size (Anime4K Restore).
+        BOOL rgbMode = getenv("ARTCNN_RGB") != NULL;
+        NSUInteger inChannels = rgbMode ? 3 : 1;
+        if (!source || inputData.length != width * height * inChannels * sizeof(float)) {
             fprintf(stderr, "bad shader or input size\n");
             return 2;
         }
@@ -33,19 +36,31 @@ int main(int argc, const char *argv[])
 
         BOOL float32 = [source containsString:@"\n// PRECISION float32\n"];
         size_t texel = float32 ? sizeof(float) : sizeof(__fp16);
-        MTLTextureDescriptor *inDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:float32 ? MTLPixelFormatR32Float : MTLPixelFormatR16Float
+        MTLPixelFormat inFormat = rgbMode ? MTLPixelFormatRGBA16Float : float32 ? MTLPixelFormatR32Float : MTLPixelFormatR16Float;
+        MTLTextureDescriptor *inDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:inFormat
                                                                                          width:width height:height mipmapped:NO];
         inDesc.usage = MTLTextureUsageShaderRead;
         inDesc.storageMode = MTLStorageModeShared;
         id<MTLTexture> input = [device newTextureWithDescriptor:inDesc];
         const float *src = inputData.bytes;
-        __fp16 *halfPixels = malloc(width * height * sizeof(__fp16));
-        for (NSUInteger i = 0; i < width * height; i++) {
-            halfPixels[i] = (__fp16)src[i];
+        if (rgbMode) {
+            __fp16 *rgba = malloc(width * height * 4 * sizeof(__fp16));
+            for (NSUInteger i = 0; i < width * height; i++) {
+                for (NSUInteger c = 0; c < 4; c++) {
+                    rgba[i * 4 + c] = (__fp16)(c < 3 ? src[i * 3 + c] : 1.0f);
+                }
+            }
+            [input replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:rgba bytesPerRow:width * 8];
+            free(rgba);
+        } else {
+            __fp16 *halfPixels = malloc(width * height * sizeof(__fp16));
+            for (NSUInteger i = 0; i < width * height; i++) {
+                halfPixels[i] = (__fp16)src[i];
+            }
+            [input replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0
+                       withBytes:float32 ? (const void *)src : halfPixels bytesPerRow:width * texel];
+            free(halfPixels);
         }
-        [input replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0
-                   withBytes:float32 ? (const void *)src : halfPixels bytesPerRow:width * texel];
-        free(halfPixels);
 
         id<MTLTexture> output = [artcnn newOutputTextureForInputWidth:width height:height];
         id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -223,7 +238,11 @@ int main(int argc, const char *argv[])
             batchMs = (CACurrentMediaTime() - start) * 1000.0 / iterations;
         }
 
-        NSUInteger outW = width * 2, outH = height * 2;
+        NSUInteger outW = output.width, outH = output.height;
+        NSUInteger outComponents = rgbMode ? 4 : 1, outChannels = rgbMode ? 3 : 1;
+        if (rgbMode) {
+            texel = 4 * sizeof(__fp16);
+        }
         id<MTLBuffer> readback = [device newBufferWithLength:outW * outH * texel options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -235,11 +254,14 @@ int main(int argc, const char *argv[])
         [cb waitUntilCompleted];
 
         const __fp16 *outHalf = readback.contents;
-        float *outFloat = malloc(outW * outH * sizeof(float));
+        float *outFloat = malloc(outW * outH * outChannels * sizeof(float));
         for (NSUInteger i = 0; i < outW * outH; i++) {
-            outFloat[i] = float32 ? ((const float *)readback.contents)[i] : outHalf[i];
+            for (NSUInteger c = 0; c < outChannels; c++) {
+                outFloat[i * outChannels + c] = float32 && !rgbMode ? ((const float *)readback.contents)[i]
+                                                                    : outHalf[i * outComponents + c];
+            }
         }
-        [[NSData dataWithBytesNoCopy:outFloat length:outW * outH * sizeof(float)] writeToFile:@(argv[5]) atomically:NO];
+        [[NSData dataWithBytesNoCopy:outFloat length:outW * outH * outChannels * sizeof(float)] writeToFile:@(argv[5]) atomically:NO];
 
         void (^report)(const char *, NSArray<NSNumber *> *) = ^(const char *label, NSArray<NSNumber *> *values) {
             NSArray *sorted = [values sortedArrayUsingSelector:@selector(compare:)];
