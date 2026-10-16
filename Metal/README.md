@@ -104,16 +104,16 @@ MTL_CAPTURE_ENABLED=1 ARTCNN_CAPTURE=frame.gputrace \
     build/artcnn_metal_cli ArtCNN_C4F16_DS.metal in.f32 1512 982 out.f32
 ```
 
-For a 16->16 Winograd layer the GPU holds occupancy at about 33% (occupancy manager
-target 42%) with the F16 limiter at 73% and the last-level cache limiter at 85%; a plain
-copy kernel reaches 89% occupancy. Raising occupancy is the next lever.
+These counters led to the current kernel: the earlier per-thread Winograd layer ran at 33%
+occupancy (occupancy manager target 42%) with the F16 limiter at 73%, while the
+`simdgroup_matrix` version is no longer throttled by the occupancy manager.
 
 ## Where the time goes
 
-Per-pass profiling (`ARTCNN_PROFILE=1`) puts each 16->16 Winograd pass at about 1.05 ms.
-A kernel that only copies one layer's activations (read and write 47 MB) takes 0.39 ms,
-close to the memory bandwidth, so each pass is roughly half memory traffic and half
-arithmetic that only partly overlaps it.
+Per-pass profiling (`ARTCNN_PROFILE=1`) puts each 16->16 pass at about 0.60 ms. A kernel
+that only copies one layer's activations (read and write 47 MB) takes 0.39 ms, close to the
+memory bandwidth, so the layers are now within about 1.5x of the memory floor. Storing the
+activations in 8 bits is the remaining way to lower that floor.
 
 Things measured and rejected with the earlier per-thread Winograd kernel (5.54-5.95 ms per
 frame), all with output matching it:
@@ -130,11 +130,8 @@ frame), all with output matching it:
 
 Folding depth-to-space into the skip-connection conv is kept: 5.61 ms to 5.54 ms, identical
 output. Indexing the result vector in a loop there made the pass 5x slower; the generator
-writes the four components explicitly.
-
-Shipped shader by input size: 1280x800 3.83 ms, 1512x982 5.54 ms, 1920x1080 7.65 ms.
+writes the four components explicitly. The same applies to arrays of `simdgroup_matrix`
+tiles: indexed with loop variables, a layer took 11 ms instead of 0.98 ms.
 
 Fusion removes a write and a read per pair but recomputes about 1.4x of the first layer
-and leaves lanes idle, which costs more than the 0.39 ms it saves. Larger fused tiles or
-Winograd F(4x4, 3x3), which needs about 1.8x fewer multiplies but has larger transform
-coefficients in half precision, are the remaining options.
+and leaves lanes idle, which costs more than the 0.39 ms it saves.
