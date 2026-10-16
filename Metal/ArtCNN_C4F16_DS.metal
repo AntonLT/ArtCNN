@@ -42,8 +42,7 @@ static inline void store(texture2d_array<half, access::write> t, int2 p, half4 v
 // PASS 3 binds=conv2d_2 save=conv2d_3 block=32x16 threads=128x1 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D-3-ReLU)
 // PASS 4 binds=conv2d_3 save=conv2d_4 block=32x16 threads=128x1 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D-4-ReLU)
 // PASS 5 binds=conv2d_4 save=conv2d_5 block=32x16 threads=128x1 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D-5)
-// PASS 6 binds=conv2d,conv2d_5 save=conv2d_6 block=12x16 threads=12x16 scale=1x1 desc=ArtCNN C4F16 DS (Conv2D-6)
-// PASS 7 binds=conv2d_6 save=OUTPUT block=12x16 threads=12x16 scale=2x2 desc=ArtCNN C4F16 DS (Depth-To-Space)
+// PASS 6 binds=conv2d,conv2d_5 save=OUTPUT block=12x16 threads=12x16 scale=1x1 desc=ArtCNN C4F16 DS (Conv2D-6) + ArtCNN C4F16 DS (Depth-To-Space)
 
 // ArtCNN C4F16 DS (Conv2D)
 kernel void artcnn_pass0(texture2d<half> LUMA [[texture(0)]],
@@ -2353,17 +2352,9 @@ kernel void artcnn_pass6(texture2d_array<half> conv2d [[texture(0)]],
     result0 += half4x4(half4(0.011924981, -0.015144949, 0.14138313, 0.078566924), half4(0.017163014, -0.02807699, 0.0028008996, -0.120849), half4(0.16702725, 0.17699935, -0.05710145, 0.055325154), half4(0.1390905, 0.05821379, 0.09878961, -0.0071945614)) * inp_3_1_2;
     result0 += half4x4(half4(-0.030453999, -0.025468823, -0.027789716, -0.013781253), half4(0.018489737, 0.034405146, 0.06269092, 0.15312864), half4(0.10282099, 0.15343723, 0.09713119, 0.1130147), half4(-0.020805998, 0.007987905, -0.035749104, -0.03274916)) * inp_3_2_2;
     const int2 output_base = int2(gid) * int2(1, 1);
-    store(out_image, output_base + int2(0, 0), result0);
-}
-
-kernel void artcnn_pass7(texture2d<half, access::read> conv2d_6 [[texture(0)]],
-                              texture2d<half, access::write> out_image [[texture(1)]],
-                              uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= out_image.get_width() || gid.y >= out_image.get_height()) {
-        return;
-    }
-    half4 v = conv2d_6.read(gid / 2);
-    half y = v[(gid.y & 1) * 2 + (gid.x & 1)];
-    out_image.write(half4(clamp(y, 0.0h, 1.0h), 0.0h, 0.0h, 1.0h), gid);
+    const half4 y = clamp(result0, 0.0h, 1.0h);
+    store(out_image, output_base * 2 + int2(0, 0), half4(y.x, 0.0h, 0.0h, 1.0h));
+    store(out_image, output_base * 2 + int2(1, 0), half4(y.y, 0.0h, 0.0h, 1.0h));
+    store(out_image, output_base * 2 + int2(0, 1), half4(y.z, 0.0h, 0.0h, 1.0h));
+    store(out_image, output_base * 2 + int2(1, 1), half4(y.w, 0.0h, 0.0h, 1.0h));
 }

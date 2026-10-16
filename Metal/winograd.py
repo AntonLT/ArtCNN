@@ -5,8 +5,9 @@ Usage: winograd.py GLSL/ArtCNN_C4F16_DS.glsl Metal/ArtCNN_C4F16_DS.metal [--fuse
 
 Passes with 16 input and 16 output channels are rebuilt as Winograd convolutions using
 weights extracted by weights.py. With --fuse a,b two consecutive 16->16 passes run in one
-kernel that keeps the intermediate activations in threadgroup memory. The first conv, the
-skip-connection conv and depth-to-space stay as translated by translate.py.
+kernel that keeps the intermediate activations in threadgroup memory. The first conv and
+the skip-connection conv stay as translated by translate.py; the skip-connection conv
+writes the final doubled luma itself, replacing the depth-to-space pass.
 """
 
 import re
@@ -211,6 +212,8 @@ def main(glsl_path, msl_path, fuse):
     for index, (p, wb) in enumerate(zip(passes, weights)):
         if index in fused_second:
             continue
+        if wb is None and p.binds == [passes[index - 1].save]:
+            continue  # depth-to-space, written directly by the previous pass
         new = len(kernels)
         line = manifest[str(index)]
         if index in fused_first:
@@ -223,7 +226,22 @@ def main(glsl_path, msl_path, fuse):
         elif is_16_to_16(p, wb):
             kernels.append(single_kernel(new, p, *wb))
         else:
-            kernels.append(re.sub(rf"artcnn_pass{index}\(", f"artcnn_pass{new}(", kernel_of(index), count=1))
+            kernel = re.sub(rf"artcnn_pass{index}\(", f"artcnn_pass{new}(", kernel_of(index), count=1)
+            following = passes[index + 1] if index + 1 < len(passes) else None
+            if following is not None and weights[index + 1] is None and following.binds == [p.save]:
+                # Depth-to-space: channel 2dy + dx goes to output pixel (2x + dx, 2y + dy).
+                # Separate component writes; indexing result0 in a loop is 5x slower.
+                old = "    store(out_image, output_base + int2(0, 0), result0);\n"
+                assert old in kernel
+                kernel = kernel.replace(old, (
+                    "    const half4 y = clamp(result0, 0.0h, 1.0h);\n"
+                    "    store(out_image, output_base * 2 + int2(0, 0), half4(y.x, 0.0h, 0.0h, 1.0h));\n"
+                    "    store(out_image, output_base * 2 + int2(1, 0), half4(y.y, 0.0h, 0.0h, 1.0h));\n"
+                    "    store(out_image, output_base * 2 + int2(0, 1), half4(y.z, 0.0h, 0.0h, 1.0h));\n"
+                    "    store(out_image, output_base * 2 + int2(1, 1), half4(y.w, 0.0h, 0.0h, 1.0h));\n"))
+                line = re.sub(r"save=\S+", "save=OUTPUT", line)
+                line = re.sub(r"desc=(.*)$", rf"desc=\1 + {following.desc}", line)
+            kernels.append(kernel)
             lines.append(re.sub(r"^// PASS \d+", f"// PASS {new}", line))
             continue
         line = re.sub(r"block=\d+x\d+ threads=\d+x\d+", f"block={BLOCK_W * 2}x{BLOCK_H * 2} threads={THREADS}x1", line)

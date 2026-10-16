@@ -7,6 +7,8 @@ Native Metal (MSL 4.1) versions of the ArtCNN GLSL shaders, generated from the o
 - `winograd.py` builds on it and replaces the five 16->16 convolutions with Winograd
   F(2x2, 3x3) kernels using weights extracted by `weights.py`. This is the shipped version.
   `--fuse a,b` runs two consecutive 16->16 layers in one kernel; it is currently slower.
+  The skip-connection conv writes the final doubled luma directly, so there is no separate
+  depth-to-space pass.
 - `ArtCNNMetal.h/.m` compiles a generated shader and encodes its passes into a command
   buffer. Input is a single-channel luma texture; output is an R16Float texture at 2x.
 
@@ -37,7 +39,7 @@ Wall-clock time per frame at 1512x982, 200-300 pipelined frames:
 
 | Implementation | Time |
 |---|---|
-| Metal Winograd (shipped) | 5.61 ms |
+| Metal Winograd (shipped) | 5.54 ms |
 | Metal direct translation | 6.23 ms |
 | MPSGraph float16 convolutions | 6.10-6.26 ms |
 | libplacebo/MoltenVK, original GLSL | 6.37 ms |
@@ -86,6 +88,14 @@ Things measured and rejected, all with output matching the shipped shader:
 | Two output groups per thread | 1.4 ms per pass |
 | Reading Winograd tiles straight from the texture | 1.22 ms per pass |
 | Fusing two layers (`--fuse 1,2 3,4`), first layer recomputed on a 1-pixel border | 7.57 ms per frame |
+| Not storing the first conv; recomputing it from luma in the passes that read it | 5.78 ms per frame |
+| Two-half Winograd tiles to cut live registers | 6.29 ms per frame |
+
+Folding depth-to-space into the skip-connection conv is kept: 5.61 ms to 5.54 ms, identical
+output. Indexing the result vector in a loop there made the pass 5x slower; the generator
+writes the four components explicitly.
+
+Shipped shader by input size: 1280x800 3.83 ms, 1512x982 5.54 ms, 1920x1080 7.65 ms.
 
 Fusion removes a write and a read per pair but recomputes about 1.4x of the first layer
 and leaves lanes idle, which costs more than the 0.39 ms it saves. Larger fused tiles or
