@@ -38,7 +38,7 @@ Wall-clock time per frame, 300 pipelined frames:
 
 | Implementation | 1280x800 | 1512x982 | 1920x1080 |
 |---|---|---|---|
-| Metal, Winograd on simdgroup_matrix (shipped) | 2.52 ms | 3.66 ms | 5.0-5.3 ms |
+| Metal, Winograd on simdgroup_matrix (shipped) | - | 3.51 ms | - |
 | Metal, direct translation | 4.51 ms | 6.23 ms | 9.00 ms |
 | libplacebo/MoltenVK, original GLSL | 4.40 ms | 6.37 ms | 8.82 ms |
 
@@ -63,6 +63,14 @@ GPU energy above idle is about 2.5x lower with Metal at every rate (Full HD: 138
 per frame against 343-377 mJ), more than the 1.7-1.8x difference in frame time. Whole-system
 power at 60 fps Full HD is 19-22 W against 33-35 W. These are IOReport estimates from the
 SoC's energy model; a paced loop in a real renderer may clock the GPU differently.
+
+## First conv
+
+The 1->16 first conv is not stored. The first 16->16 pass and the skip-connection pass stage
+the luma block and compute its 16 channels per staged pixel (zero outside the image), which
+removes a 47 MB write and two 47 MB reads: 3.51 ms per frame at 1512x982 instead of 3.66 ms,
+with identical output. Computing it per (pixel, channel group) instead re-read the luma
+neighborhood four times and gained nothing.
 
 ## How the 16->16 kernel works
 

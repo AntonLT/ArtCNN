@@ -5,9 +5,11 @@ Usage: winograd.py GLSL/ArtCNN_C4F16_DS.glsl Metal/ArtCNN_C4F16_DS.metal
 
 Each pass with 16 input and 16 output channels becomes a Winograd F(2x2, 3x3) convolution
 whose products run on the 8x8 matrix hardware: in the Winograd domain every transform
-position k is a product M_k[tiles][16 out] = V_k[tiles][16 in] x U_k[16 in][16 out]. The
-first conv stays as translated by translate.py, and the skip-connection conv writes the
-final doubled luma itself, replacing the depth-to-space pass.
+position k is a product M_k[tiles][16 out] = V_k[tiles][16 in] x U_k[16 in][16 out].
+
+The first conv (1->16) is never stored: the passes that read its output recompute it from
+a staged luma block, which costs far less than writing and reading 16 channels. The
+skip-connection conv writes the final doubled luma itself, replacing depth-to-space.
 """
 
 import re
@@ -38,17 +40,47 @@ def transformed_weights(w):
     return np.einsum("ak,oikl,bl->oiab", G, w.astype(np.float64), G)
 
 
+def emit_luma_stage(emit, origin, w, h):
+    """Stage luma for a w x h block of first-conv outputs (plus a one-pixel border)."""
+    emit(f"    threadgroup half luma[{h + 2}][{w + 2}];")
+    emit(f"    for (uint i = tid; i < {(h + 2) * (w + 2)}; i += {THREADS}) {{")
+    emit(f"        luma[i / {w + 2}][i % {w + 2}] = load(LUMA, {origin} - 1 + int2(i % {w + 2}, i / {w + 2})).x;")
+    emit("    }")
+    emit("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+
+def conv0_expr(w0, b0, g, y, x):
+    """First conv, channels 4g..4g+3 at staged luma position (x, y), in the GLSL's order."""
+    terms = [f"half4({', '.join(half(v) for v in b0[g * 4:g * 4 + 4])})"]
+    for ky in range(3):
+        for kx in range(3):
+            terms.append(f"half4({', '.join(half(w0[g * 4 + i, 0, ky, kx]) for i in range(4))}) "
+                         f"* luma[{y} + {ky}][{x} + {kx}]")
+    return " + ".join(terms)
+
+
+def emit_conv0_pixels(emit, w0, b0, origin, store):
+    """For each staged pixel, compute all 16 first-conv channels once and hand group g to store(g, value)."""
+    emit(f"    for (uint r = tid; r < {STAGE_H * STAGE_W}; r += {THREADS}) {{")
+    emit(f"        const uint sy = r / {STAGE_W}, sx = r % {STAGE_W};")
+    emit(f"        const int2 px = {origin} + int2(sx, sy);")
+    emit("        const bool inside = all(px >= 0) && px.x < int(LUMA.get_width()) && px.y < int(LUMA.get_height());")
+    for g in range(4):
+        emit(f"        {store(g, f'inside ? {conv0_expr(w0, b0, g, 'sy', 'sx')} : half4(0.0h)')}")
+    emit("    }")
+
+
 def is_16_to_16(p, wb):
     return wb is not None and wb[0].shape[:2] == (16, 16) and len(p.binds) == 1
 
 
-def winograd_kernel(index, p, w, b):
+def winograd_kernel(index, p, w, b, conv0=None):
     u = transformed_weights(w)  # [out, in, a, c]
     table = np.zeros((16, 16, 16), np.float64)  # [position][in][out]
     for k in range(16):
         a, c = divmod(k, 4)
         table[k] = u[:, :, a, c].T
-    src = p.binds[0]
+    src = "LUMA" if conv0 else p.binds[0]
     relu = "ReLU" in p.desc
     lines = []
     emit = lines.append
@@ -56,7 +88,8 @@ def winograd_kernel(index, p, w, b):
     emit(f"constant half winograd_b{index}[16] = {{{', '.join(half(x) for x in b)}}};")
     emit("")
     emit(f"// {p.desc} (Winograd F(2x2, 3x3) on simdgroup_matrix)")
-    emit(f"kernel void artcnn_pass{index}(texture2d_array<half> {src} [[texture(0)]],")
+    in_type = "texture2d<half>" if conv0 else "texture2d_array<half>"
+    emit(f"kernel void artcnn_pass{index}({in_type} {src} [[texture(0)]],")
     emit("    texture2d_array<half, access::write> out_image [[texture(1)]],")
     emit("    uint2 tgid [[threadgroup_position_in_grid]],")
     emit("    uint tid [[thread_index_in_threadgroup]],")
@@ -70,12 +103,17 @@ def winograd_kernel(index, p, w, b):
     emit(f"    threadgroup half4 (*staged)[{STAGE_H}][2][{STAGE_W // 2}] = "
          f"(threadgroup half4 (*)[{STAGE_H}][2][{STAGE_W // 2}])V;")
     emit(f"    const int2 block = int2(tgid) * int2({BLOCK_W}, {BLOCK_H});")
-    emit(f"    for (uint i = tid; i < {4 * STAGE_H * STAGE_W}; i += {THREADS}) {{")
-    emit(f"        uint g = i / {STAGE_H * STAGE_W}, r = i % {STAGE_H * STAGE_W};")
-    emit(f"        int2 px = block - 1 + int2(r % {STAGE_W}, r / {STAGE_W});")
-    emit(f"        staged[g][r / {STAGE_W}][(r % {STAGE_W}) & 1][(r % {STAGE_W}) >> 1] = "
-         f"load({src}, px * 2 + int2(g & 1, g >> 1));")
-    emit("    }")
+    if conv0:
+        emit_luma_stage(emit, "block - 1", STAGE_W, STAGE_H)
+        emit_conv0_pixels(emit, *conv0, "block - 1",
+                          lambda g, v: f"staged[{g}][sy][sx & 1][sx >> 1] = {v};")
+    else:
+        emit(f"    for (uint i = tid; i < {4 * STAGE_H * STAGE_W}; i += {THREADS}) {{")
+        emit(f"        uint g = i / {STAGE_H * STAGE_W}, r = i % {STAGE_H * STAGE_W};")
+        emit(f"        int2 px = block - 1 + int2(r % {STAGE_W}, r / {STAGE_W});")
+        emit(f"        staged[g][r / {STAGE_W}][(r % {STAGE_W}) & 1][(r % {STAGE_W}) >> 1] = "
+             f"load({src}, px * 2 + int2(g & 1, g >> 1));")
+        emit("    }")
     emit("    threadgroup_barrier(mem_flags::mem_threadgroup);")
     emit("")
     emit(f"    const uint tile = tid % {TILES}, grp = tid / {TILES};")
@@ -170,6 +208,44 @@ def winograd_kernel(index, p, w, b):
     return "\n".join(lines) + "\n"
 
 
+def skip_kernel(index, p, w, b, conv0):
+    """Skip-connection conv (16 -> 4) on conv0 + previous, writing the doubled luma."""
+    assert w.shape[:2] == (4, 16) and p.binds[0] != "LUMA"
+    prev = p.binds[1]
+    lines = []
+    emit = lines.append
+    emit(f"// {p.desc} + depth-to-space, first conv recomputed from luma")
+    emit(f"kernel void artcnn_pass{index}(texture2d<half> LUMA [[texture(0)]],")
+    emit(f"    texture2d_array<half> {prev} [[texture(1)]],")
+    emit("    texture2d<half, access::write> out_image [[texture(2)]],")
+    emit("    uint2 tgid [[threadgroup_position_in_grid]],")
+    emit("    uint tid [[thread_index_in_threadgroup]])")
+    emit("{")
+    emit(f"    threadgroup half4 staged[4][{STAGE_H}][{STAGE_W}];")
+    emit(f"    const int2 block = int2(tgid) * int2({BLOCK_W}, {BLOCK_H});")
+    emit_luma_stage(emit, "block - 1", STAGE_W, STAGE_H)
+    emit_conv0_pixels(emit, *conv0, "block - 1",
+                      lambda g, v: f"staged[{g}][sy][sx] = load({prev}, px * 2 + int2({g & 1}, {g >> 1})) + ({v});")
+    emit("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+    emit(f"    const uint x = tid % {BLOCK_W}, y = tid / {BLOCK_W};")
+    terms = [f"half4({', '.join(half(v) for v in b)})"]
+    for ig in range(4):
+        for ky in range(3):
+            for kx in range(3):
+                cols = ["half4(" + ", ".join(half(w[i, ig * 4 + j, ky, kx]) for i in range(4)) + ")" for j in range(4)]
+                terms.append(f"half4x4({', '.join(cols)}) * staged[{ig}][y + {ky}][x + {kx}]")
+    emit("    half4 result = " + "\n        + ".join(terms) + ";")
+    emit("    // Depth-to-space: channel 2dy + dx goes to output pixel (2x + dx, 2y + dy).")
+    emit("    const half4 v = clamp(result, 0.0h, 1.0h);")
+    emit("    const int2 o = (block + int2(x, y)) * 2;")
+    emit("    store(out_image, o + int2(0, 0), half4(v.x, 0.0h, 0.0h, 1.0h));")
+    emit("    store(out_image, o + int2(1, 0), half4(v.y, 0.0h, 0.0h, 1.0h));")
+    emit("    store(out_image, o + int2(0, 1), half4(v.z, 0.0h, 0.0h, 1.0h));")
+    emit("    store(out_image, o + int2(1, 1), half4(v.w, 0.0h, 0.0h, 1.0h));")
+    emit("}")
+    return "\n".join(lines) + "\n"
+
+
 def main(glsl_path, msl_path):
     translate.main(glsl_path, msl_path)
     text = open(msl_path).read()
@@ -181,15 +257,27 @@ def main(glsl_path, msl_path):
         return m.group(0)
 
     manifest = {index: line for line, index in re.findall(r"(?m)^(// PASS (\d+) .*)$", text)}
+    first = passes[0]
+    assert first.binds == ["LUMA"] and weights[0][0].shape[:2] == (16, 1)
     kernels, lines = [], []
     for index, (p, wb) in enumerate(zip(passes, weights)):
+        if index == 0:
+            continue  # the first conv is recomputed by the passes that read it
         if wb is None and p.binds == [passes[index - 1].save]:
             continue  # depth-to-space, written directly by the previous pass
         new = len(kernels)
         line = re.sub(r"^// PASS \d+", f"// PASS {new}", manifest[str(index)])
+        binds = ",".join("LUMA" if name == first.save else name for name in p.binds)
+        line = re.sub(r"binds=\S+", f"binds={binds}", line)
+        reads_first = first.save in p.binds
         if is_16_to_16(p, wb):
-            kernels.append(winograd_kernel(new, p, *wb))
+            kernels.append(winograd_kernel(new, p, *wb, conv0=weights[0] if reads_first else None))
             line = re.sub(r"block=\d+x\d+ threads=\d+x\d+", f"block={BLOCK_W * 2}x{BLOCK_H * 2} threads={THREADS}x1", line)
+        elif reads_first and wb[0].shape[:2] == (4, 16):
+            kernels.append(skip_kernel(new, p, *wb, weights[0]))
+            line = re.sub(r"save=\S+", "save=OUTPUT", line)
+            line = re.sub(r"block=\d+x\d+ threads=\d+x\d+", f"block={BLOCK_W}x{BLOCK_H} threads={THREADS}x1", line)
+            line = re.sub(r"desc=(.*)$", rf"desc=\1 + {passes[index + 1].desc}", line)
         else:
             kernel = re.sub(rf"artcnn_pass{index}\(", f"artcnn_pass{new}(", kernel_of(index), count=1)
             following = passes[index + 1] if index + 1 < len(passes) else None
