@@ -41,26 +41,23 @@ def conv3x3(x, w, b):
 
 
 def winograd16(x, w, b, m):
-    """3x3 conv with zero padding as Winograd in float16; m = output tile size."""
-    BT, G, AT = (m_[k] for m_, k in ((m, "BT"), (m, "G"), (m, "AT")))
-    n = BT.shape[0]
+    """3x3 conv with zero padding as Winograd in float16; m = (vertical, horizontal) transforms."""
+    my, mx = m if isinstance(m, tuple) else (m, m)
+    ny, nx = my["BT"].shape[0], mx["BT"].shape[0]
     c, h, wd = x.shape
-    th, tw = -(-h // (n - 2)), -(-wd // (n - 2))
-    p = np.zeros((c, th * (n - 2) + 2, tw * (n - 2) + 2), np.float16)
+    th, tw = -(-h // (ny - 2)), -(-wd // (nx - 2))
+    p = np.zeros((c, th * (ny - 2) + 2, tw * (nx - 2) + 2), np.float16)
     p[:, 1:h + 1, 1:wd + 1] = x
-    # Tiles: [c, th, tw, n, n] with stride n - 2.
-    idx_y = (np.arange(th) * (n - 2))[:, None] + np.arange(n)[None, :]
-    idx_x = (np.arange(tw) * (n - 2))[:, None] + np.arange(n)[None, :]
+    idx_y = (np.arange(th) * (ny - 2))[:, None] + np.arange(ny)[None, :]
+    idx_x = (np.arange(tw) * (nx - 2))[:, None] + np.arange(nx)[None, :]
     d = p[:, idx_y[:, None, :, None], idx_x[None, :, None, :]]
-    bt = BT.astype(np.float16)
-    v = np.einsum("ab,ctsbd->ctsad", bt, d).astype(np.float16)
-    v = np.einsum("ctsad,ed->ctsae", v, bt).astype(np.float16)
-    u = np.einsum("ak,oikl,bl->oiab", G, w.astype(np.float64), G).astype(np.float16)
+    v = np.einsum("ab,ctsbd->ctsad", my["BT"].astype(np.float16), d).astype(np.float16)
+    v = np.einsum("ctsad,ed->ctsae", v, mx["BT"].astype(np.float16)).astype(np.float16)
+    u = np.einsum("ak,oikl,bl->oiab", my["G"], w.astype(np.float64), mx["G"]).astype(np.float16)
     mm = np.einsum("oiab,itsab->otsab", u, v).astype(np.float16)
-    at = AT.astype(np.float16)
-    y = np.einsum("ra,otsab->otsrb", at, mm).astype(np.float16)
-    y = np.einsum("otsrb,qb->otsrq", y, at).astype(np.float16)
-    out = y.transpose(0, 1, 3, 2, 4).reshape(w.shape[0], th * (n - 2), tw * (n - 2))[:, :h, :wd]
+    y = np.einsum("ra,otsab->otsrb", my["AT"].astype(np.float16), mm).astype(np.float16)
+    y = np.einsum("otsrb,qb->otsrq", y, mx["AT"].astype(np.float16)).astype(np.float16)
+    out = y.transpose(0, 1, 3, 2, 4).reshape(w.shape[0], th * (ny - 2), tw * (nx - 2))[:, :h, :wd]
     return out.astype(np.float32) + b[:, None, None]
 
 
@@ -90,7 +87,7 @@ def main(glsl):
     rng = np.random.default_rng(2)
     for name, x in (("real crop", real[300:812, 400:912]), ("noise", rng.random((256, 256), dtype=np.float32))):
         ref = forward(passes, weights, x)
-        for label, m in (("F(2x2, 3x3)", F2), ("F(4x4, 3x3)", F4)):
+        for label, m in (("F(2x2, 3x3)", F2), ("F(4x2, 3x3) hybrid", (F2, F4)), ("F(4x4, 3x3)", F4)):
             out = forward(passes, weights, x, m)
             mse = float(np.mean((out - ref) ** 2))
             codes = np.abs(np.round(out * 255) - np.round(ref * 255))

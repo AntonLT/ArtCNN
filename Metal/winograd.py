@@ -3,9 +3,10 @@
 
 Usage: winograd.py GLSL/ArtCNN_C4F16_DS.glsl Metal/ArtCNN_C4F16_DS.metal
 
-Each pass with 16 input and 16 output channels becomes a Winograd F(2x2, 3x3) convolution
-whose products run on the 8x8 matrix hardware: in the Winograd domain every transform
-position k is a product M_k[tiles][16 out] = V_k[tiles][16 in] x U_k[16 in][16 out].
+Each pass with 16 input and 16 output channels becomes a Winograd convolution, F(4, 3)
+across and F(2, 3) down, whose products run on the 8x8 matrix hardware: in the Winograd
+domain every transform position k is a product M_k[tiles][16 out] = V_k[tiles][16 in] x
+U_k[16 in][16 out]. Tiles stay in registers for the whole layer.
 
 The first conv (1->16) is never stored: the passes that read its output recompute it from
 a staged luma block, which costs far less than writing and reading 16 channels. The
@@ -22,22 +23,14 @@ from weights import load
 
 G = np.array([[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]], np.float64)
 
-# Output block per threadgroup: 8x4 Winograd tiles (16x8 pixels), 128 threads. Each thread
-# owns one tile and one group of 4 channels for the input and output transforms.
-TILES_X, TILES_Y = 8, 4
-TILES = TILES_X * TILES_Y
-BLOCK_W, BLOCK_H = TILES_X * 2, TILES_Y * 2
 THREADS = 128
+# The skip-connection pass computes one pixel per thread on a 16x8 block.
+BLOCK_W, BLOCK_H = 16, 8
 STAGE_W, STAGE_H = BLOCK_W + 2, BLOCK_H + 2
 
 
 def half(v):
     return f"{float(v):.9g}"
-
-
-def transformed_weights(w):
-    # U[o, i] = G g G^T, a 4x4 matrix per (output, input) channel pair.
-    return np.einsum("ak,oikl,bl->oiab", G, w.astype(np.float64), G)
 
 
 def emit_luma_stage(emit, origin, w, h):
@@ -59,10 +52,11 @@ def conv0_expr(w0, b0, g, y, x):
     return " + ".join(terms)
 
 
-def emit_conv0_pixels(emit, w0, b0, origin, store):
+def emit_conv0_pixels(emit, w0, b0, origin, store, sw=None, sh=None):
     """For each staged pixel, compute all 16 first-conv channels once and hand group g to store(g, value)."""
-    emit(f"    for (uint r = tid; r < {STAGE_H * STAGE_W}; r += {THREADS}) {{")
-    emit(f"        const uint sy = r / {STAGE_W}, sx = r % {STAGE_W};")
+    sw, sh = sw or STAGE_W, sh or STAGE_H
+    emit(f"    for (uint r = tid; r < {sh * sw}; r += {THREADS}) {{")
+    emit(f"        const uint sy = r / {sw}, sx = r % {sw};")
     emit(f"        const int2 px = {origin} + int2(sx, sy);")
     emit("        const bool inside = all(px >= 0) && px.x < int(LUMA.get_width()) && px.y < int(LUMA.get_height());")
     for g in range(4):
@@ -74,20 +68,62 @@ def is_16_to_16(p, wb):
     return wb is not None and wb[0].shape[:2] == (16, 16) and len(p.binds) == 1
 
 
-def winograd_kernel(index, p, w, b, conv0=None):
-    u = transformed_weights(w)  # [out, in, a, c]
-    table = np.zeros((16, 16, 16), np.float64)  # [position][in][out]
-    for k in range(16):
-        a, c = divmod(k, 4)
-        table[k] = u[:, :, a, c].T
+# Hybrid tiles: F(4, 3) across and F(2, 3) down, 4x2 output pixels from a 6x4 window.
+F43 = dict(
+    BT=np.array([[4, 0, -5, 0, 1, 0], [0, -4, -4, 1, 1, 0], [0, 4, -4, -1, 1, 0],
+                 [0, -2, -1, 2, 1, 0], [0, 2, -1, -2, 1, 0], [0, 4, 0, -5, 0, 1]], np.float64),
+    G=np.array([[1 / 4, 0, 0], [-1 / 6, -1 / 6, -1 / 6], [-1 / 6, 1 / 6, -1 / 6],
+                [1 / 24, 1 / 12, 1 / 6], [1 / 24, -1 / 12, 1 / 6], [0, 0, 1]], np.float64),
+    AT=np.array([[1, 1, 1, 1, 1, 0], [0, 1, -1, 2, -2, 0], [0, 1, 1, 4, 4, 0], [0, 1, -1, 8, -8, 1]], np.float64),
+)
+F23 = dict(
+    BT=np.array([[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]], np.float64),
+    G=G,
+    AT=np.array([[1, 1, 1, 0], [0, 1, -1, -1]], np.float64),
+)
+HYB_TX, HYB_TY = 8, 4  # tiles per threadgroup: one row of 8 per SIMD group
+HYB_W, HYB_H = HYB_TX * 4, HYB_TY * 2  # 32x8 output pixels
+HYB_SW, HYB_SH = HYB_W + 2, HYB_H + 2
+
+
+def combo(row, names):
+    """Linear combination sum(row[i] * names[i]) as MSL, skipping zeros and unit multiplies."""
+    terms = []
+    for coef, name in zip(row, names):
+        if coef == 0:
+            continue
+        if coef == 1:
+            terms.append(f"+ {name}")
+        elif coef == -1:
+            terms.append(f"- {name}")
+        else:
+            terms.append(f"{'-' if coef < 0 else '+'} {float(abs(coef))!r}h * {name}")
+    text = " ".join(terms)
+    return text[2:] if text.startswith("+ ") else "-" + text[2:]
+
+
+def hybrid_kernel(index, p, w, b, conv0=None):
+    """16->16 layer as Winograd F(4, 3) across x F(2, 3) down, with every tile in registers.
+
+    SIMD group sg owns tile row sg (8 tiles of 4x2 pixels). Lane l is row r = (q & 4) + (l / 2) % 4
+    and column pair c = (q & 2) * 2 + (l % 2) * 2 of an 8x8 simdgroup matrix (q = l / 4; checked
+    at startup by ArtCNNMetal), so it transforms tile r's 6x4 window for channels c, c+1, 8+c,
+    9+c: exactly its elements of the two V_k matrices for each of the 24 positions k. The
+    products land in the same lane, which folds them into the output transform.
+    """
+    u = np.einsum("ak,oikl,bl->oiab", F23["G"], w.astype(np.float64), F43["G"])  # [out, in, 4, 6]
+    table = np.zeros((24, 16, 16), np.float64)
+    for a in range(4):
+        for c in range(6):
+            table[a * 6 + c] = u[:, :, a, c].T
     src = "LUMA" if conv0 else p.binds[0]
     relu = "ReLU" in p.desc
     lines = []
     emit = lines.append
-    emit(f"constant half winograd_u{index}[16 * 16 * 16] = {{{', '.join(half(x) for x in table.ravel())}}};")
+    emit(f"constant half winograd_u{index}[24 * 16 * 16] = {{{', '.join(half(x) for x in table.ravel())}}};")
     emit(f"constant half winograd_b{index}[16] = {{{', '.join(half(x) for x in b)}}};")
     emit("")
-    emit(f"// {p.desc} (Winograd F(2x2, 3x3) on simdgroup_matrix)")
+    emit(f"// {p.desc} (Winograd F(4, 3) x F(2, 3), tiles in registers, products on simdgroup_matrix)")
     in_type = "texture2d<half>" if conv0 else "texture2d_array<half>"
     emit(f"kernel void artcnn_pass{index}({in_type} {src} [[texture(0)]],")
     emit("    texture2d_array<half, access::write> out_image [[texture(1)]],")
@@ -96,114 +132,90 @@ def winograd_kernel(index, p, w, b, conv0=None):
     emit("    ushort sg [[simdgroup_index_in_threadgroup]],")
     emit("    ushort lane [[thread_index_in_simdgroup]])")
     emit("{")
-    # Threadgroup memory limits occupancy, so one 8 KB buffer holds first the staged input
-    # (columns split by parity so lanes read consecutive addresses), then 8 transform
-    # positions at a time.
-    emit(f"    threadgroup half V[8][{TILES}][16];")
-    emit(f"    threadgroup half4 (*staged)[{STAGE_H}][2][{STAGE_W // 2}] = "
-         f"(threadgroup half4 (*)[{STAGE_H}][2][{STAGE_W // 2}])V;")
-    emit(f"    const int2 block = int2(tgid) * int2({BLOCK_W}, {BLOCK_H});")
+    emit(f"    threadgroup half4 staged[4][{HYB_SH}][2][{HYB_SW // 2}];")
+    emit(f"    const int2 block = int2(tgid) * int2({HYB_W}, {HYB_H});")
     if conv0:
-        emit_luma_stage(emit, "block - 1", STAGE_W, STAGE_H)
+        emit_luma_stage(emit, "block - 1", HYB_SW, HYB_SH)
         emit_conv0_pixels(emit, *conv0, "block - 1",
-                          lambda g, v: f"staged[{g}][sy][sx & 1][sx >> 1] = {v};")
+                          lambda g, v: f"staged[{g}][sy][sx & 1][sx >> 1] = {v};", HYB_SW, HYB_SH)
     else:
-        emit(f"    for (uint i = tid; i < {4 * STAGE_H * STAGE_W}; i += {THREADS}) {{")
-        emit(f"        uint g = i / {STAGE_H * STAGE_W}, r = i % {STAGE_H * STAGE_W};")
-        emit(f"        int2 px = block - 1 + int2(r % {STAGE_W}, r / {STAGE_W});")
-        emit(f"        staged[g][r / {STAGE_W}][(r % {STAGE_W}) & 1][(r % {STAGE_W}) >> 1] = "
+        emit(f"    for (uint i = tid; i < {4 * HYB_SH * HYB_SW}; i += {THREADS}) {{")
+        emit(f"        uint g = i / {HYB_SH * HYB_SW}, r = i % {HYB_SH * HYB_SW};")
+        emit(f"        int2 px = block - 1 + int2(r % {HYB_SW}, r / {HYB_SW});")
+        emit(f"        staged[g][r / {HYB_SW}][(r % {HYB_SW}) & 1][(r % {HYB_SW}) >> 1] = "
              f"load({src}, px * 2 + int2(g & 1, g >> 1));")
         emit("    }")
     emit("    threadgroup_barrier(mem_flags::mem_threadgroup);")
     emit("")
-    emit(f"    const uint tile = tid % {TILES}, grp = tid / {TILES};")
-    emit(f"    const uint tx = tile % {TILES_X}, ty = tile / {TILES_X};")
-    emit("    half4 t[4][4];  // B^T d for this thread's tile and input group")
-    emit("    {")
-    emit("        half4 d[4][4];")
-    emit("        for (uint r = 0; r < 4; r++) {")
-    emit("            for (uint c = 0; c < 4; c++) {")
-    emit("                d[r][c] = staged[grp][ty * 2 + r][c & 1][tx + (c >> 1)];")
-    emit("            }")
-    emit("        }")
-    emit("        for (uint c = 0; c < 4; c++) {")
-    emit("            t[0][c] = d[0][c] - d[2][c];")
-    emit("            t[1][c] = d[1][c] + d[2][c];")
-    emit("            t[2][c] = d[2][c] - d[1][c];")
-    emit("            t[3][c] = d[1][c] - d[3][c];")
-    emit("        }")
-    emit("    }")
-    emit("    threadgroup_barrier(mem_flags::mem_threadgroup);")
-    emit("")
-    emit("    // Lane l holds elements (mr, mc) and (mr, mc + 1) of an 8x8 simdgroup matrix,")
-    emit("    // measured on an M4 Pro; used to fill the weight tiles from the constant table.")
     emit("    const uint q = lane / 4;")
     emit("    const uint mr = (q & 4) + (lane / 2) % 4, mc = (q & 2) * 2 + (lane % 2) * 2;")
-    emit("    half4 s[2][4];  // rows of A^T m with A^T = [[1, 1, 1, 0], [0, 1, -1, -1]]")
-    for batch in range(2):
-        emit(f"    {{ // transform rows {batch * 2}-{batch * 2 + 1}: positions {batch * 8}-{batch * 8 + 7}")
-        emit("        for (uint rr = 0; rr < 2; rr++) {")
-        emit(f"            const uint r = {batch * 2} + rr;")
-        emit("            const half4 v[4] = {t[r][0] - t[r][2], t[r][1] + t[r][2], t[r][2] - t[r][1], t[r][1] - t[r][3]};")
-        emit("            for (uint c = 0; c < 4; c++) {")
-        emit("                *(threadgroup half4 *)&V[rr * 4 + c][tile][grp * 4] = v[c];")
-        emit("            }")
-        emit("        }")
-        emit("        threadgroup_barrier(mem_flags::mem_threadgroup);")
-        # Unrolled with constant names: indexing tile arrays with loop variables spills them.
-        for slot in range(2):
-            emit(f"        {{ // SIMD group sg multiplies local position sg * 2 + {slot}")
-            emit(f"            const uint lk = sg * 2 + {slot};")
-            emit(f"            constant half *uk = winograd_u{index} + ({batch * 8} + lk) * 256;")
+    emit("    const uint tx = mr, ty = sg;")
+    emit("    const uint g0 = mc / 4;")
+    emit("    const bool hi = (mc & 2) != 0;")
+    emit("    // Window rows r (4) and columns c (6) for channels mc, mc+1, 8+mc, 9+mc.")
+    for r in range(4):
+        for c in range(6):
+            col = f"tx * 4 + {c}"
+            emit(f"    half4 d{r}{c};")
+            emit("    {")
+            emit(f"        const half4 lo4 = staged[g0][ty * 2 + {r}][{c & 1}][tx * 2 + {c >> 1}];")
+            emit(f"        const half4 hi4 = staged[g0 + 2][ty * 2 + {r}][{c & 1}][tx * 2 + {c >> 1}];")
+            emit(f"        d{r}{c} = hi ? half4(lo4.zw, hi4.zw) : half4(lo4.xy, hi4.xy);")
+            emit("    }")
+    emit("    // Across: t = d B_x (F(4, 3)), then down: V = B_y^T t (F(2, 3)).")
+    for r in range(4):
+        for c in range(6):
+            emit(f"    const half4 t{r}{c} = {combo(F43['BT'][c], [f'd{r}{cc}' for cc in range(6)])};")
+    for a in range(4):
+        for c in range(6):
+            emit(f"    const half4 v{a}{c} = {combo(F23['BT'][a], [f't{r}{c}' for r in range(4)])};")
+    emit("    half4 s[2][6];  // rows of A_y^T m")
+    emit("    for (uint c = 0; c < 6; c++) {")
+    emit("        s[0][c] = half4(0.0h);")
+    emit("        s[1][c] = half4(0.0h);")
+    emit("    }")
+    for a in range(4):
+        for c in range(6):
+            k = a * 6 + c
+            emit("    {")
+            emit(f"        constant half *uk = winograd_u{index} + {k * 256};")
+            emit("        simdgroup_half8x8 a0, a1, u00, u01, u10, u11;")
+            emit(f"        a0.thread_elements()[0] = v{a}{c}.x;")
+            emit(f"        a0.thread_elements()[1] = v{a}{c}.y;")
+            emit(f"        a1.thread_elements()[0] = v{a}{c}.z;")
+            emit(f"        a1.thread_elements()[1] = v{a}{c}.w;")
             for kh in range(2):
                 for oh in range(2):
-                    emit(f"            simdgroup_half8x8 u{kh}{oh};")
                     for e in range(2):
-                        emit(f"            u{kh}{oh}.thread_elements()[{e}] = uk[({kh * 8} + mr) * 16 + {oh * 8} + mc + {e}];")
-            for tb in range(TILES // 8):
-                emit("            {")
-                emit(f"                threadgroup half *rows = &V[lk][{tb * 8}][0];")
-                emit("                simdgroup_half8x8 a0, a1;")
-                emit("                simdgroup_load(a0, rows, 16, ulong2(0, 0));")
-                emit("                simdgroup_load(a1, rows, 16, ulong2(8, 0));")
-                emit("                simdgroup_half8x8 c0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);")
-                emit("                simdgroup_half8x8 c1 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);")
-                emit("                simdgroup_multiply_accumulate(c0, a0, u00, c0);")
-                emit("                simdgroup_multiply_accumulate(c0, a1, u10, c0);")
-                emit("                simdgroup_multiply_accumulate(c1, a0, u01, c1);")
-                emit("                simdgroup_multiply_accumulate(c1, a1, u11, c1);")
-                emit("                simdgroup_store(c0, rows, 16, ulong2(0, 0));")
-                emit("                simdgroup_store(c1, rows, 16, ulong2(8, 0));")
-                emit("            }")
-            emit("        }")
-        emit("        threadgroup_barrier(mem_flags::mem_threadgroup);")
-        emit("        half4 m[8];")
-        emit("        for (uint k = 0; k < 8; k++) {")
-        emit("            m[k] = *(threadgroup half4 *)&V[k][tile][grp * 4];")
-        emit("        }")
-        emit("        for (uint c = 0; c < 4; c++) {")
-        if batch == 0:
-            emit("            s[0][c] = m[c] + m[4 + c];")
-            emit("            s[1][c] = m[4 + c];")
-        else:
-            emit("            s[0][c] += m[c];")
-            emit("            s[1][c] -= m[c] + m[4 + c];")
-        emit("        }")
-        if batch == 0:
-            emit("        threadgroup_barrier(mem_flags::mem_threadgroup);")
-        emit("    }")
-    emit(f"    const half4 bias = half4(winograd_b{index}[grp * 4], winograd_b{index}[grp * 4 + 1], "
-         f"winograd_b{index}[grp * 4 + 2], winograd_b{index}[grp * 4 + 3]);")
-    emit("    for (uint r = 0; r < 2; r++) {")
-    emit("        half4 y0 = s[r][0] + s[r][1] + s[r][2] + bias;")
-    emit("        half4 y1 = s[r][1] - s[r][2] - s[r][3] + bias;")
-    if relu:
-        emit("        y0 = max(y0, half4(0.0h));")
-        emit("        y1 = max(y1, half4(0.0h));")
-    emit("        const int2 sub = int2(grp & 1, grp >> 1);")
-    emit("        store(out_image, (block + int2(tx * 2, ty * 2 + r)) * 2 + sub, y0);")
-    emit("        store(out_image, (block + int2(tx * 2 + 1, ty * 2 + r)) * 2 + sub, y1);")
-    emit("    }")
+                        emit(f"        u{kh}{oh}.thread_elements()[{e}] = uk[({kh * 8} + mr) * 16 + {oh * 8} + mc + {e}];")
+            emit("        simdgroup_half8x8 c0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h), c1 = c0;")
+            emit("        simdgroup_multiply_accumulate(c0, a0, u00, c0);")
+            emit("        simdgroup_multiply_accumulate(c0, a1, u10, c0);")
+            emit("        simdgroup_multiply_accumulate(c1, a0, u01, c1);")
+            emit("        simdgroup_multiply_accumulate(c1, a1, u11, c1);")
+            emit("        const half4 m = half4(c0.thread_elements()[0], c0.thread_elements()[1], "
+                 "c1.thread_elements()[0], c1.thread_elements()[1]);")
+            for i in range(2):
+                coef = F23["AT"][i][a]
+                if coef == 1:
+                    emit(f"        s[{i}][{c}] += m;")
+                elif coef == -1:
+                    emit(f"        s[{i}][{c}] -= m;")
+            emit("    }")
+    emit(f"    const half4 bias = half4(winograd_b{index}[mc], winograd_b{index}[mc + 1], "
+         f"winograd_b{index}[8 + mc], winograd_b{index}[9 + mc]);")
+    for i in range(2):
+        for j in range(4):
+            emit(f"    {{ // output row {i}, column {j}")
+            emit(f"        half4 y = {combo(F43['AT'][j], [f's[{i}][{c}]' for c in range(6)])} + bias;")
+            if relu:
+                emit("        y = max(y, half4(0.0h));")
+            emit("        const half4 other = simd_shuffle_xor(y, ushort(1));")
+            emit("        const half4 even = hi ? other : y, odd = hi ? y : other;")
+            emit("        const uint g = hi ? g0 + 2 : g0;")
+            emit("        const half4 texel = hi ? half4(even.zw, odd.zw) : half4(even.xy, odd.xy);")
+            emit(f"        store(out_image, (block + int2(tx * 4 + {j}, ty * 2 + {i})) * 2 + int2(g & 1, g >> 1), texel);")
+            emit("    }")
     emit("}")
     return "\n".join(lines) + "\n"
 
@@ -271,8 +283,8 @@ def main(glsl_path, msl_path):
         line = re.sub(r"binds=\S+", f"binds={binds}", line)
         reads_first = first.save in p.binds
         if is_16_to_16(p, wb):
-            kernels.append(winograd_kernel(new, p, *wb, conv0=weights[0] if reads_first else None))
-            line = re.sub(r"block=\d+x\d+ threads=\d+x\d+", f"block={BLOCK_W * 2}x{BLOCK_H * 2} threads={THREADS}x1", line)
+            kernels.append(hybrid_kernel(new, p, *wb, conv0=weights[0] if reads_first else None))
+            line = re.sub(r"block=\d+x\d+ threads=\d+x\d+", f"block={HYB_W * 2}x{HYB_H * 2} threads={THREADS}x1", line)
         elif reads_first and wb[0].shape[:2] == (4, 16):
             kernels.append(skip_kernel(new, p, *wb, weights[0]))
             line = re.sub(r"save=\S+", "save=OUTPUT", line)

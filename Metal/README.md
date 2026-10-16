@@ -4,10 +4,11 @@ Native Metal (MSL 4.1) versions of the ArtCNN GLSL shaders, generated from the o
 `GLSL/*.glsl` files so the weights stay identical. Only `C4F16_DS` is generated so far.
 
 - `translate.py` converts each mpv/libplacebo pass into a Metal compute kernel, line for line.
-- `winograd.py` builds on it and replaces the five 16->16 convolutions with Winograd
-  F(2x2, 3x3) kernels whose products run on the 8x8 matrix hardware (`simdgroup_matrix`),
-  using weights extracted by `weights.py`. The skip-connection conv writes the final doubled
-  luma directly, so there is no separate depth-to-space pass. This is the shipped version.
+- `winograd.py` builds on it and generates the shipped shader: the five 16->16 convolutions
+  as Winograd F(4, 3) across x F(2, 3) down with the products on the 8x8 matrix hardware
+  (`simdgroup_matrix`) and every tile kept in registers, using weights extracted by
+  `weights.py`. The first conv is recomputed from luma where it is read, and the
+  skip-connection conv writes the final doubled luma, so a frame takes six passes.
 - `ArtCNNMetal.h/.m` compiles a generated shader and encodes its passes into a command
   buffer. Input is a single-channel luma texture; output is an R16Float texture at 2x.
 
@@ -38,7 +39,7 @@ Wall-clock time per frame, 300 pipelined frames:
 
 | Implementation | 1280x800 | 1512x982 | 1920x1080 |
 |---|---|---|---|
-| Metal, Winograd on simdgroup_matrix (shipped) | - | 3.51 ms | - |
+| Metal, shipped | 2.22 ms | 3.21 ms | 4.38 ms |
 | Metal, direct translation | 4.51 ms | 6.23 ms | 9.00 ms |
 | libplacebo/MoltenVK, original GLSL | 4.40 ms | 6.37 ms | 8.82 ms |
 
@@ -95,34 +96,41 @@ where F(2x2, 3x3) stays at 86.2 dB and 64.7 dB with at most 1 code.
 
 ## How the 16->16 kernel works
 
-Each threadgroup computes a 16x8 pixel block (32 Winograd tiles) with 128 threads:
+Each threadgroup computes a 32x8 pixel block with 128 threads; SIMD group sg owns one row of
+8 tiles of 4x2 pixels.
 
-1. Stage the input block plus a one-pixel border into threadgroup memory.
-2. Each thread reads one tile for one group of 4 input channels into registers (B^T d).
-3. In two batches of 8 transform positions, write the transformed tiles to threadgroup
-   memory, multiply each position's (32 tiles x 16) block by its 16x16 weight matrix with
-   8x8 `simdgroup_matrix` operations in place, and fold the products into the rows of the
-   output transform.
-4. Finish the output transform (A^T m A), add bias, apply ReLU, write 2x2 pixels.
+1. Stage the input block plus a one-pixel border (34x10 pixels) into threadgroup memory.
+2. Lane l stands for row r = (q & 4) + (l / 2) % 4 and column pair c = (q & 2) * 2 + (l % 2) * 2
+   of an 8x8 `simdgroup_matrix` (q = l / 4). It reads tile r's 6x4 window for channels c,
+   c+1, 8+c and 9+c and computes the Winograd input transform in registers; the results are
+   exactly its elements of the two input matrices for each of the 24 transform positions.
+3. For each position, fill the four 8x8 weight tiles per lane from a constant table and
+   multiply; the products land in the same lane, which folds them into the output transform.
+4. Add bias, apply ReLU, exchange channel pairs with the neighbor lane (`simd_shuffle_xor`)
+   and write full 4-channel texels.
 
-One 8 KB threadgroup buffer serves both the staged input and the transformed tiles; at 22 KB
-occupancy fell to 12% and the layer took 1.21 ms instead of 0.60 ms. Weight tiles are
-filled per lane from a constant table using the lane-to-element layout of `simdgroup_matrix`,
-measured on an M4 Pro: lane l holds row `(q & 4) + (l / 2) % 4`, columns
-`(q & 2) * 2 + (l % 2) * 2` and the next one, with q = l / 4. Metal does not document this
-layout (MLX relies on the same one), so `ArtCNNMetal` checks it on the device at startup and
-fails initialization if it differs. Loading the tiles with `simdgroup_load` through
-threadgroup memory instead is layout-independent but took 5.2 ms per frame instead of 3.66.
+Metal does not document the lane-to-element layout (measured on an M4 Pro; MLX relies on the
+same one), so `ArtCNNMetal` checks it on the device at startup and fails initialization if it
+differs. Loading weight tiles with `simdgroup_load` through threadgroup memory instead is
+layout-independent but took 5.2 ms per frame where the per-lane fill took 3.66 ms.
 
-Per-layer counters before and after (1512x982):
+Kernel history at 1512x982 (time per 16->16 layer, frame):
 
-| | Winograd, per-thread math | Winograd on simdgroup_matrix |
-|---|---|---|
-| Time per 16->16 layer | 0.98 ms | 0.60 ms |
+| Kernel | Layer | Frame | Notes |
+|---|---|---|---|
+| Winograd F(2x2), per-thread math | 0.98 ms | 5.54 ms | F16 limiter 73%, occupancy 33% |
+| Direct conv on `simdgroup_matrix` | 0.98 ms | | 2.25x the multiplies, F16 limiter 94% |
+| F(2x2) on `simdgroup_matrix`, 22 KB threadgroup memory | 1.21 ms | 6.64 ms | occupancy 12% |
+| F(2x2) on `simdgroup_matrix`, 8 KB, batched through threadgroup memory | 0.60 ms | 3.66 ms | |
+| F(2x2), tiles in registers | 0.59 ms | 3.43 ms | threadgroup traffic -4x, F16 limiter still 84% |
+| F(4, 3) x F(2, 3), tiles in registers (shipped) | 0.55 ms | 3.21 ms | 25% fewer products |
 
-A plain implicit-GEMM conv on `simdgroup_matrix` (no Winograd) also took 0.98 ms per layer,
-with the F16 limiter at 94% and the occupancy manager no longer throttling: the matrix
-hardware does 2.25x the multiplies of the per-thread Winograd kernel in the same time.
+With tiles in registers the layer is bound by half-precision arithmetic, and on M4 the
+matrix operations run on those units, so the remaining lever is the number of products.
+The hybrid tile has 24 transform positions per 8 output pixels instead of 16 per 4. Its
+larger coefficients cost a little precision: against ONNX on the 1600x1300 test image, 44 of
+8.3 million output values are off by 3-4 codes (1 before) and the mean error is 0.197 codes
+(0.196 before). Full F(4x4, 3x3) would cut products further but fails the precision check below.
 
 ## Layout
 
