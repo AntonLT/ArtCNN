@@ -21,6 +21,20 @@ from winograd import F23, F43, combo
 WIN_W, WIN_H = 32, 8
 WIN_SW, WIN_SH = WIN_W + 2, WIN_H + 2
 
+# Frame-to-frame reuse (see ArtCNNMetal reuseUnchangedBlocks): blocks skip when their 16x8
+# cells are clean. A direct 3x3 layer depends on input 1 pixel away; a Winograd layer's
+# rounding depends on its whole tile window, 4 pixels across and 2 down.
+CELL_W, CELL_H = 16, 8
+DIRTY_PARAMS = ["device const uchar *dirty [[buffer(0)]]", "constant uint &cells_x [[buffer(1)]]"]
+
+
+def emit_dirty_check(emit, cells):
+    """Return early when all of this threadgroup's `cells` mask cells are clean."""
+    emit(f"    const uint cell = tgid.y * cells_x + tgid.x * {cells};")
+    emit("    if (" + " && ".join(f"(tgid.x * {cells} + {i} >= cells_x || !dirty[cell + {i}])" for i in range(cells)) + ") {")
+    emit("        return;  // nothing within the dependency radius changed since the last frame")
+    emit("    }")
+
 BLOCK_W, BLOCK_H = 16, 8
 THREADS = BLOCK_W * BLOCK_H
 STAGE_W, STAGE_H = BLOCK_W + 2, BLOCK_H + 2
@@ -69,9 +83,11 @@ def layer_kernel(index, layer, names):
         params.append(f"texture2d<half> MAIN [[texture({len(textures) - 1})]]")
     for k, name in enumerate(out_textures):
         params.append(f"texture2d<half, access::write> out{k} [[texture({len(textures) + k})]]")
+    params += DIRTY_PARAMS
     params += ["uint2 tgid [[threadgroup_position_in_grid]]", "uint tid [[thread_index_in_threadgroup]]"]
     emit(f"kernel void artcnn_pass{index}(" + ",\n    ".join(params) + ")")
     emit("{")
+    emit_dirty_check(emit, BLOCK_W // CELL_W)
     emit(f"    threadgroup half4 staged[{len(textures)}][{STAGE_H}][{STAGE_W}];")
     emit(f"    const int2 block = int2(tgid) * int2({BLOCK_W}, {BLOCK_H});")
     emit(f"    for (uint i = tid; i < {len(textures) * STAGE_H * STAGE_W}; i += {THREADS}) {{")
@@ -144,11 +160,14 @@ def winograd_kernel(index, layer):
     emit(f"    texture2d<half> {src_b} [[texture(1)]],")
     emit("    texture2d<half, access::write> out0 [[texture(2)]],")
     emit("    texture2d<half, access::write> out1 [[texture(3)]],")
+    for param in DIRTY_PARAMS:
+        emit(f"    {param},")
     emit("    uint2 tgid [[threadgroup_position_in_grid]],")
     emit("    uint tid [[thread_index_in_threadgroup]],")
     emit("    ushort sg [[simdgroup_index_in_threadgroup]],")
     emit("    ushort lane [[thread_index_in_simdgroup]])")
     emit("{")
+    emit_dirty_check(emit, WIN_W // CELL_W)
     emit(f"    threadgroup half4 staged[2][{WIN_SH}][2][{WIN_SW // 2}];  // [texture][row][column parity][column / 2]")
     emit(f"    const int2 block = int2(tgid) * int2({WIN_W}, {WIN_H});")
     emit(f"    for (uint i = tid; i < {2 * WIN_SH * WIN_SW}; i += {THREADS}) {{")
@@ -235,6 +254,7 @@ def main(glsl_path, msl_path):
         for s in layer.saves:
             names.setdefault(s, s)
     manifest, kernels = [], []
+    radius_x = radius_y = 0
     for index, layer in enumerate(layers):
         binds = []
         for name, _ in layer.inputs:
@@ -246,13 +266,17 @@ def main(glsl_path, msl_path):
         if is_crelu_16_to_8(layer):
             block = f"{WIN_W}x{WIN_H}"
             kernels.append(winograd_kernel(index, layer))
+            radius_x, radius_y = radius_x + 4, radius_y + 2
         else:
             block = f"{BLOCK_W}x{BLOCK_H}"
             kernels.append(layer_kernel(index, layer, names))
+            radius_x, radius_y = radius_x + 1, radius_y + 1
         manifest.append(f"// PASS {index} binds={','.join(binds)} save={saves} block={block} "
                         f"threads={THREADS}x1 scale=1x1 desc={layer.passes[0]}")
     with open(msl_path, "w") as f:
-        f.write(PRELUDE.format(source=glsl_path.split("/")[-1]) + "\n".join(manifest) + "\n\n" + "\n".join(kernels))
+        f.write(PRELUDE.format(source=glsl_path.split("/")[-1]) +
+                f"// REUSE radius={radius_x}x{radius_y} cell={CELL_W}x{CELL_H}\n" +
+                "\n".join(manifest) + "\n\n" + "\n".join(kernels))
 
 
 if __name__ == "__main__":

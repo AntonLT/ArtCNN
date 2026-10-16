@@ -18,6 +18,7 @@ static inline void store(texture2d<half, access::write> t, int2 p, half4 v)
 }
 
 // OUTPUT scale=1 format=rgba16f
+// REUSE radius=14x8 cell=16x8
 // PASS 0 binds=MAIN save=conv2d_tf,conv2d_tf1 block=16x8 threads=128x1 scale=1x1 desc=Anime4K-v4.0-Restore-CNN-(L)-Conv-4x3x3x3
 // PASS 1 binds=conv2d_tf,conv2d_tf1 save=conv2d_1_tf,conv2d_1_tf1 block=32x8 threads=128x1 scale=1x1 desc=Anime4K-v4.0-Restore-CNN-(L)-Conv-4x3x3x16
 // PASS 2 binds=conv2d_1_tf,conv2d_1_tf1 save=conv2d_2_tf,conv2d_2_tf1 block=32x8 threads=128x1 scale=1x1 desc=Anime4K-v4.0-Restore-CNN-(L)-Conv-4x3x3x16
@@ -28,9 +29,15 @@ static inline void store(texture2d<half, access::write> t, int2 p, half4 v)
 kernel void artcnn_pass0(texture2d<half> MAIN [[texture(0)]],
     texture2d<half, access::write> out0 [[texture(1)]],
     texture2d<half, access::write> out1 [[texture(2)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 1;
+    if ((tgid.x * 1 + 0 >= cells_x || !dirty[cell + 0])) {
+        return;  // nothing within the dependency radius changed since the last frame
+    }
     threadgroup half4 staged[1][10][18];
     const int2 block = int2(tgid) * int2(16, 8);
     for (uint i = tid; i < 180; i += 128) {
@@ -93,11 +100,17 @@ kernel void artcnn_pass1(texture2d<half> conv2d_tf [[texture(0)]],
     texture2d<half> conv2d_tf1 [[texture(1)]],
     texture2d<half, access::write> out0 [[texture(2)]],
     texture2d<half, access::write> out1 [[texture(3)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 2;
+    if ((tgid.x * 2 + 0 >= cells_x || !dirty[cell + 0]) && (tgid.x * 2 + 1 >= cells_x || !dirty[cell + 1])) {
+        return;  // nothing within the dependency radius changed since the last frame
+    }
     threadgroup half4 staged[2][10][2][17];  // [texture][row][column parity][column / 2]
     const int2 block = int2(tgid) * int2(32, 8);
     for (uint i = tid; i < 680; i += 128) {
@@ -846,11 +859,17 @@ kernel void artcnn_pass2(texture2d<half> conv2d_1_tf [[texture(0)]],
     texture2d<half> conv2d_1_tf1 [[texture(1)]],
     texture2d<half, access::write> out0 [[texture(2)]],
     texture2d<half, access::write> out1 [[texture(3)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 2;
+    if ((tgid.x * 2 + 0 >= cells_x || !dirty[cell + 0]) && (tgid.x * 2 + 1 >= cells_x || !dirty[cell + 1])) {
+        return;  // nothing within the dependency radius changed since the last frame
+    }
     threadgroup half4 staged[2][10][2][17];  // [texture][row][column parity][column / 2]
     const int2 block = int2(tgid) * int2(32, 8);
     for (uint i = tid; i < 680; i += 128) {
@@ -1599,11 +1618,17 @@ kernel void artcnn_pass3(texture2d<half> conv2d_2_tf [[texture(0)]],
     texture2d<half> conv2d_2_tf1 [[texture(1)]],
     texture2d<half, access::write> out0 [[texture(2)]],
     texture2d<half, access::write> out1 [[texture(3)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 2;
+    if ((tgid.x * 2 + 0 >= cells_x || !dirty[cell + 0]) && (tgid.x * 2 + 1 >= cells_x || !dirty[cell + 1])) {
+        return;  // nothing within the dependency radius changed since the last frame
+    }
     threadgroup half4 staged[2][10][2][17];  // [texture][row][column parity][column / 2]
     const int2 block = int2(tgid) * int2(32, 8);
     for (uint i = tid; i < 680; i += 128) {
@@ -2349,9 +2374,15 @@ kernel void artcnn_pass4(texture2d<half> conv2d_3_tf [[texture(0)]],
     texture2d<half> conv2d_3_tf1 [[texture(1)]],
     texture2d<half> MAIN [[texture(2)]],
     texture2d<half, access::write> out0 [[texture(3)]],
+    device const uchar *dirty [[buffer(0)]],
+    constant uint &cells_x [[buffer(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
+    const uint cell = tgid.y * cells_x + tgid.x * 1;
+    if ((tgid.x * 1 + 0 >= cells_x || !dirty[cell + 0])) {
+        return;  // nothing within the dependency radius changed since the last frame
+    }
     threadgroup half4 staged[3][10][18];
     const int2 block = int2(tgid) * int2(16, 8);
     for (uint i = tid; i < 540; i += 128) {

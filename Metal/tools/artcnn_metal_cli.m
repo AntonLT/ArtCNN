@@ -69,14 +69,14 @@ int main(int argc, const char *argv[])
         // B must give byte-identical output to B computed in full; then time alternating A/B
         // frames for several rectangle sizes.
         if (getenv("ARTCNN_REUSE_TEST")) {
-            NSUInteger outW = width * 2, outH = height * 2;
+            NSUInteger outW = output.width, outH = output.height, outBytes = rgbMode ? 8 : 2;
             NSData * (^readback)(id<MTLTexture>) = ^(id<MTLTexture> texture) {
-                id<MTLBuffer> buf = [device newBufferWithLength:outW * outH * 2 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> buf = [device newBufferWithLength:outW * outH * outBytes options:MTLResourceStorageModeShared];
                 id<MTLCommandBuffer> cb = [queue commandBuffer];
                 id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
                 [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                            sourceSize:MTLSizeMake(outW, outH, 1) toBuffer:buf destinationOffset:0
-               destinationBytesPerRow:outW * 2 destinationBytesPerImage:outW * outH * 2];
+               destinationBytesPerRow:outW * outBytes destinationBytesPerImage:outW * outH * outBytes];
                 [blit endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
@@ -89,19 +89,24 @@ int main(int argc, const char *argv[])
                 [cb waitUntilCompleted];
             };
             for (NSNumber *fraction in @[@0.0, @0.02, @0.1, @0.3, @1.0]) {
-                // B: invert a centered rectangle covering `fraction` of the image.
-                __fp16 *pixels = malloc(width * height * sizeof(__fp16));
+                // B: invert a centered rectangle covering `fraction` of the image (all channels).
                 const float *a = inputData.bytes;
                 NSUInteger rw = (NSUInteger)(width * sqrt(fraction.doubleValue)), rh = (NSUInteger)(height * sqrt(fraction.doubleValue));
                 NSUInteger x0 = (width - rw) / 2, y0 = (height - rh) / 2;
+                NSUInteger components = rgbMode ? 4 : 1;
+                __fp16 *pixels = malloc(width * height * components * sizeof(__fp16));
                 for (NSUInteger y = 0; y < height; y++) {
                     for (NSUInteger x = 0; x < width; x++) {
                         BOOL inside = x >= x0 && x < x0 + rw && y >= y0 && y < y0 + rh;
-                        pixels[y * width + x] = (__fp16)(inside ? 1.0f - a[y * width + x] : a[y * width + x]);
+                        for (NSUInteger c = 0; c < components; c++) {
+                            float v = rgbMode ? (c < 3 ? a[(y * width + x) * 3 + c] : 1.0f) : a[y * width + x];
+                            pixels[(y * width + x) * components + c] = (__fp16)(inside && c < 3 ? 1.0f - v : v);
+                        }
                     }
                 }
                 id<MTLTexture> inputB = [device newTextureWithDescriptor:inDesc];
-                [inputB replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:pixels bytesPerRow:width * sizeof(__fp16)];
+                [inputB replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:pixels
+                          bytesPerRow:width * components * sizeof(__fp16)];
                 free(pixels);
 
                 ArtCNNMetal *reuse = [[ArtCNNMetal alloc] initWithDevice:device source:source error:&error];

@@ -265,3 +265,9 @@ Time per frame on an M4 Pro, 200 pipelined frames:
 |---|---|---|---|
 | 1920x1080 | 1.94 ms | 5.27 ms | 7.65 ms |
 | 3024x1964 | 5.50 ms | 14.85 ms | 21.3 ms |
+
+Block reuse works as for ArtCNN (`// REUSE radius=14x8`: 1 pixel per direct layer, 4 across
+and 2 down per Winograd layer; the change mask compares all four channels). With
+`ARTCNN_RGB=1 ARTCNN_REUSE_TEST=1` at 3024x1890 the output is byte-identical to a full
+computation in every case: 0.87 ms per frame when nothing changed, 1.38 ms with 10% of the
+image changed, 5.75 ms when all of it changed (5.38 ms without reuse).

@@ -80,7 +80,7 @@ static NSString *const kDirtyMaskSource =
      "    if (gid.x >= luma.get_width() || gid.y >= luma.get_height()) {\n"
      "        return;\n"
      "    }\n"
-     "    if (luma.read(gid).x != prev.read(gid).x) {\n"
+     "    if (any(luma.read(gid) != prev.read(gid))) {\n"
      "        atomic_store_explicit(&changed[(gid.y / cfg.w) * cfg.x + gid.x / cfg.z], 1u, memory_order_relaxed);\n"
      "    }\n"
      "}\n"
