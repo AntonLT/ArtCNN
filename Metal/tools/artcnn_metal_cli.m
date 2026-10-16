@@ -71,6 +71,31 @@ int main(int argc, const char *argv[])
             printf("saved GPU trace to %s\n", getenv("ARTCNN_CAPTURE"));
         }
 
+        // ARTCNN_FPS=n ARTCNN_SECONDS=s renders one frame per 1/n s for s seconds, waiting for
+        // each frame, like a paced stream; used for power measurements.
+        if (getenv("ARTCNN_FPS")) {
+            double period = 1.0 / atof(getenv("ARTCNN_FPS"));
+            double seconds = getenv("ARTCNN_SECONDS") ? atof(getenv("ARTCNN_SECONDS")) : 10.0;
+            CFTimeInterval start = CACurrentMediaTime(), next = start;
+            int frames = 0, late = 0;
+            while (CACurrentMediaTime() - start < seconds) {
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                [artcnn encodeToCommandBuffer:cb input:input output:output];
+                [cb commit];
+                [cb waitUntilCompleted];
+                frames++;
+                next += period;
+                double wait = next - CACurrentMediaTime();
+                if (wait > 0) {
+                    usleep((useconds_t)(wait * 1e6));
+                } else {
+                    late++;
+                }
+            }
+            printf("metal paced: %d frames in %.2f s, %d late\n", frames, CACurrentMediaTime() - start, late);
+            return 0;
+        }
+
         // ARTCNN_ONLY_PASS=n runs just that pass in the timing loops, for counter captures.
         NSRange passes = NSMakeRange(0, artcnn.passCount);
         if (getenv("ARTCNN_ONLY_PASS")) {

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
@@ -173,6 +174,31 @@ int main(int argc, char **argv)
     params.dither_params = NULL;
 
     pl_renderer renderer = pl_renderer_create(log, gpu);
+
+    // ARTCNN_FPS=n ARTCNN_SECONDS=s renders one frame per 1/n s for s seconds, waiting for
+    // each frame, like a paced stream; used for power measurements.
+    if (getenv("ARTCNN_FPS")) {
+        double period = 1000.0 / atof(getenv("ARTCNN_FPS"));
+        double seconds = getenv("ARTCNN_SECONDS") ? atof(getenv("ARTCNN_SECONDS")) : 10.0;
+        double start = now_ms(), next = start;
+        int frames = 0, late = 0;
+        params.info_callback = NULL;
+        while (now_ms() - start < seconds * 1000.0) {
+            pl_render_image(renderer, &image, &target, &params);
+            pl_gpu_finish(gpu);
+            frames++;
+            next += period;
+            double wait = next - now_ms();
+            if (wait > 0) {
+                struct timespec ts = { (time_t)(wait / 1000.0), (long)(fmod(wait, 1000.0) * 1e6) };
+                nanosleep(&ts, NULL);
+            } else {
+                late++;
+            }
+        }
+        printf("libplacebo paced: %d frames in %.2f s, %d late\n", frames, (now_ms() - start) / 1000.0, late);
+        return 0;
+    }
     // libplacebo reports a pass's timer result on a later frame, so warm up first
     // and attribute each frame's callbacks to that frame index.
     int total = iterations > 0 ? iterations + 16 : 1;

@@ -47,6 +47,23 @@ MPSGraph's float16 convolutions take 6.1-6.3 ms at 1512x982.
 libplacebo's own per-pass GPU timers report about 0.5 ms at 1512x982 on MoltenVK, which
 would exceed the GPU's peak arithmetic rate by 9x, so only wall-clock time is compared.
 
+## Power
+
+`tools/energy.py` renders frames paced at a fixed rate (waiting for each frame, like a stream)
+and reads GPU and package power with `macmon` (IOReport, no sudo; `brew install macmon`),
+averaging the steady part of each run. Two alternating runs per row, M4 Pro, 15 s each:
+
+| Input | Rate | Metal GPU power | MoltenVK GPU power | Metal frames late | MoltenVK frames late |
+|---|---|---|---|---|---|
+| 1920x1080 | 24 fps | 3.4-3.8 W | 8.7-9.1 W | 0/360 | 5-6/360 |
+| 1920x1080 | 60 fps | 7.5-9.3 W | 20.7-22.7 W | 1-2/900 | 25-27/900 |
+| 1512x982 | 120 fps | 11.4-13.2 W | 32.5-33.4 W | 7-11/1800 | 117-134/1800 |
+
+GPU energy above idle is about 2.5x lower with Metal at every rate (Full HD: 138-154 mJ
+per frame against 343-377 mJ), more than the 1.7-1.8x difference in frame time. Whole-system
+power at 60 fps Full HD is 19-22 W against 33-35 W. These are IOReport estimates from the
+SoC's energy model; a paced loop in a real renderer may clock the GPU differently.
+
 ## How the 16->16 kernel works
 
 Each threadgroup computes a 16x8 pixel block (32 Winograd tiles) with 128 threads:
