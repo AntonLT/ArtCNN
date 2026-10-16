@@ -6,6 +6,7 @@ Native Metal (MSL 4.1) versions of the ArtCNN GLSL shaders, generated from the o
 - `translate.py` converts each mpv/libplacebo pass into a Metal compute kernel, line for line.
 - `winograd.py` builds on it and replaces the five 16->16 convolutions with Winograd
   F(2x2, 3x3) kernels using weights extracted by `weights.py`. This is the shipped version.
+  `--fuse a,b` runs two consecutive 16->16 layers in one kernel; it is currently slower.
 - `ArtCNNMetal.h/.m` compiles a generated shader and encodes its passes into a command
   buffer. Input is a single-channel luma texture; output is an R16Float texture at 2x.
 
@@ -32,22 +33,36 @@ Results on an M4 Pro (20-core GPU), macOS 27, `Images/artcnn_examples.png` luma 
 | `translate.py` (half) | 59.5 dB | 2 |
 | Original GLSL via libplacebo/MoltenVK | 56.0 dB | 3 |
 
-Wall-clock time per frame, 300 pipelined frames, median of 3 runs:
+Wall-clock time per frame at 1512x982, 200-300 pipelined frames:
 
-| Input | Metal Winograd | Metal direct | libplacebo/MoltenVK |
-|---|---|---|---|
-| 1280x800 | 4.18 ms | 4.51 ms | 4.40 ms |
-| 1512x982 | 6.04 ms | 6.48 ms | 6.37 ms |
-| 1920x1080 | 8.34 ms | 9.00 ms | 8.82 ms |
+| Implementation | Time |
+|---|---|
+| Metal Winograd (shipped) | 5.95 ms |
+| Metal direct translation | 6.48 ms |
+| MPSGraph float16 convolutions | 6.10-6.26 ms |
+| libplacebo/MoltenVK, original GLSL | 6.37 ms |
 
 libplacebo's own per-pass GPU timers report about 0.5 ms at 1512x982 on MoltenVK, which
 would exceed the GPU's peak arithmetic rate by 9x, so only wall-clock time is compared.
 
-`tools/mpsgraph_cli.m` runs the same network through Apple's MPSGraph convolutions
-(float16, weights from `tools/export_weights.py`): 6.26 ms at 1512x982 against 6.05 ms for
-the Winograd shader in the same session, with matching output (59.5 dB, at most 2 codes).
+## Where the time goes
 
-Per-pass profiling (`ARTCNN_PROFILE=1`) shows each 16->16 pass at about 1.05 ms whether it
-uses Winograd or direct convolution, so these passes are limited by moving the 16-channel
-activations through memory rather than by arithmetic. Fusing consecutive convolutions to
-keep activations in threadgroup memory is the next optimization to try.
+Per-pass profiling (`ARTCNN_PROFILE=1`) puts each 16->16 Winograd pass at about 1.05 ms.
+A kernel that only copies one layer's activations (read and write 47 MB) takes 0.39 ms,
+close to the memory bandwidth, so each pass is roughly half memory traffic and half
+arithmetic that only partly overlaps it.
+
+Things measured and rejected, all with output matching the shipped shader:
+
+| Change | Result |
+|---|---|
+| Weights in a `constant` table instead of immediates | 23 ms |
+| Output group per threadgroup (grid z) instead of per SIMD group | 2.0 ms per pass |
+| Two output groups per thread | 1.4 ms per pass |
+| Reading Winograd tiles straight from the texture | 1.22 ms per pass |
+| Fusing two layers (`--fuse 1,2 3,4`), first layer recomputed on a 1-pixel border | 7.57 ms per frame |
+
+Fusion removes a write and a read per pair but recomputes about 1.4x of the first layer
+and leaves lanes idle, which costs more than the 0.39 ms it saves. Larger fused tiles or
+Winograd F(4x4, 3x3), which needs about 1.8x fewer multiplies but has larger transform
+coefficients in half precision, are the remaining options.
