@@ -119,7 +119,34 @@ static inline void store(texture2d<half, access::write> t, int2 p, half4 v)
         t.write(v, uint2(p));
     }}
 }}
+
+// 16-channel activations live in a 4-slice texture array at stream resolution, so each
+// group of 4 channels is contiguous. Kernels keep the GLSL's 2x2 tiled coordinates:
+// tiled texel (2x + gx, 2y + gy) is slice 2gy + gx at pixel (x, y).
+static inline half4 load(texture2d_array<half> t, int2 p)
+{{
+    return t.sample(zero_border, float2(p >> 1) + 0.5f, uint((p.y & 1) * 2 + (p.x & 1)));
+}}
+
+static inline void store(texture2d_array<half, access::write> t, int2 p, half4 v)
+{{
+    int2 q = p >> 1;
+    if (q.x < int(t.get_width()) && q.y < int(t.get_height())) {{
+        t.write(v, uint2(q), uint((p.y & 1) * 2 + (p.x & 1)));
+    }}
+}}
 """
+
+
+def tiled_textures(passes):
+    """Names of the 16-channel activations, stored as 4-slice texture arrays."""
+    return {p.save for p in passes if p.scale == (2.0, 2.0) and p.save != "OUTPUT"}
+
+
+def texture_param(name, index, tiled, write=False):
+    kind = "texture2d_array" if name in tiled else "texture2d"
+    access = ", access::write" if write else ""
+    return f"{kind}<half{access}> {'out_image' if write else name} [[texture({index})]]"
 
 DEPTH_TO_SPACE = """\
 kernel void artcnn_pass{index}(texture2d<half, access::read> {src} [[texture(0)]],
@@ -139,6 +166,7 @@ kernel void artcnn_pass{index}(texture2d<half, access::read> {src} [[texture(0)]
 def main(glsl_path, msl_path, float32=False):
     src = open(glsl_path).read()
     passes = parse(src)
+    tiled = tiled_textures(passes)
     manifest = []
     kernels = []
     for index, p in enumerate(passes):
@@ -149,8 +177,8 @@ def main(glsl_path, msl_path, float32=False):
             assert len(p.binds) == 1
             kernels.append(DEPTH_TO_SPACE.format(index=index, src=p.binds[0]))
             continue
-        params = [f"texture2d<half> {name} [[texture({i})]]" for i, name in enumerate(p.binds)]
-        params.append(f"texture2d<half, access::write> out_image [[texture({len(p.binds)})]]")
+        params = [texture_param(name, i, tiled) for i, name in enumerate(p.binds)]
+        params.append(texture_param(p.save, len(p.binds), tiled, write=True))
         params += ["uint2 gid [[thread_position_in_grid]]",
                    "uint2 lid [[thread_position_in_threadgroup]]",
                    "uint2 tgid [[threadgroup_position_in_grid]]"]

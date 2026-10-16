@@ -20,6 +20,22 @@ static inline void store(texture2d<half, access::write> t, int2 p, half4 v)
         t.write(v, uint2(p));
     }
 }
+
+// 16-channel activations live in a 4-slice texture array at stream resolution, so each
+// group of 4 channels is contiguous. Kernels keep the GLSL's 2x2 tiled coordinates:
+// tiled texel (2x + gx, 2y + gy) is slice 2gy + gx at pixel (x, y).
+static inline half4 load(texture2d_array<half> t, int2 p)
+{
+    return t.sample(zero_border, float2(p >> 1) + 0.5f, uint((p.y & 1) * 2 + (p.x & 1)));
+}
+
+static inline void store(texture2d_array<half, access::write> t, int2 p, half4 v)
+{
+    int2 q = p >> 1;
+    if (q.x < int(t.get_width()) && q.y < int(t.get_height())) {
+        t.write(v, uint2(q), uint((p.y & 1) * 2 + (p.x & 1)));
+    }
+}
 // PASS 0 binds=LUMA save=conv2d block=24x32 threads=12x16 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D)
 // PASS 1 binds=conv2d save=conv2d_1 block=32x16 threads=128x1 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D-1-ReLU)
 // PASS 2 binds=conv2d_1 save=conv2d_2 block=32x16 threads=128x1 scale=2x2 desc=ArtCNN C4F16 DS (Conv2D-2-ReLU)
@@ -31,7 +47,7 @@ static inline void store(texture2d<half, access::write> t, int2 p, half4 v)
 
 // ArtCNN C4F16 DS (Conv2D)
 kernel void artcnn_pass0(texture2d<half> LUMA [[texture(0)]],
-    texture2d<half, access::write> out_image [[texture(1)]],
+    texture2d_array<half, access::write> out_image [[texture(1)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint2 tgid [[threadgroup_position_in_grid]])
@@ -109,8 +125,8 @@ kernel void artcnn_pass0(texture2d<half> LUMA [[texture(0)]],
 }
 
 // ArtCNN C4F16 DS (Conv2D-1-ReLU) (Winograd F(2x2, 3x3))
-kernel void artcnn_pass1(texture2d<half> conv2d [[texture(0)]],
-    texture2d<half, access::write> out_image [[texture(1)]],
+kernel void artcnn_pass1(texture2d_array<half> conv2d [[texture(0)]],
+    texture2d_array<half, access::write> out_image [[texture(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
@@ -535,8 +551,8 @@ kernel void artcnn_pass1(texture2d<half> conv2d [[texture(0)]],
 }
 
 // ArtCNN C4F16 DS (Conv2D-2-ReLU) (Winograd F(2x2, 3x3))
-kernel void artcnn_pass2(texture2d<half> conv2d_1 [[texture(0)]],
-    texture2d<half, access::write> out_image [[texture(1)]],
+kernel void artcnn_pass2(texture2d_array<half> conv2d_1 [[texture(0)]],
+    texture2d_array<half, access::write> out_image [[texture(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
@@ -961,8 +977,8 @@ kernel void artcnn_pass2(texture2d<half> conv2d_1 [[texture(0)]],
 }
 
 // ArtCNN C4F16 DS (Conv2D-3-ReLU) (Winograd F(2x2, 3x3))
-kernel void artcnn_pass3(texture2d<half> conv2d_2 [[texture(0)]],
-    texture2d<half, access::write> out_image [[texture(1)]],
+kernel void artcnn_pass3(texture2d_array<half> conv2d_2 [[texture(0)]],
+    texture2d_array<half, access::write> out_image [[texture(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
@@ -1387,8 +1403,8 @@ kernel void artcnn_pass3(texture2d<half> conv2d_2 [[texture(0)]],
 }
 
 // ArtCNN C4F16 DS (Conv2D-4-ReLU) (Winograd F(2x2, 3x3))
-kernel void artcnn_pass4(texture2d<half> conv2d_3 [[texture(0)]],
-    texture2d<half, access::write> out_image [[texture(1)]],
+kernel void artcnn_pass4(texture2d_array<half> conv2d_3 [[texture(0)]],
+    texture2d_array<half, access::write> out_image [[texture(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
@@ -1813,8 +1829,8 @@ kernel void artcnn_pass4(texture2d<half> conv2d_3 [[texture(0)]],
 }
 
 // ArtCNN C4F16 DS (Conv2D-5) (Winograd F(2x2, 3x3))
-kernel void artcnn_pass5(texture2d<half> conv2d_4 [[texture(0)]],
-    texture2d<half, access::write> out_image [[texture(1)]],
+kernel void artcnn_pass5(texture2d_array<half> conv2d_4 [[texture(0)]],
+    texture2d_array<half, access::write> out_image [[texture(1)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
@@ -2237,8 +2253,8 @@ kernel void artcnn_pass5(texture2d<half> conv2d_4 [[texture(0)]],
 }
 
 // ArtCNN C4F16 DS (Conv2D-6)
-kernel void artcnn_pass6(texture2d<half> conv2d [[texture(0)]],
-    texture2d<half> conv2d_5 [[texture(1)]],
+kernel void artcnn_pass6(texture2d_array<half> conv2d [[texture(0)]],
+    texture2d_array<half> conv2d_5 [[texture(1)]],
     texture2d<half, access::write> out_image [[texture(2)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],

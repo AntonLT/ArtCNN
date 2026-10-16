@@ -37,13 +37,38 @@ Wall-clock time per frame at 1512x982, 200-300 pipelined frames:
 
 | Implementation | Time |
 |---|---|
-| Metal Winograd (shipped) | 5.95 ms |
-| Metal direct translation | 6.48 ms |
+| Metal Winograd (shipped) | 5.61 ms |
+| Metal direct translation | 6.23 ms |
 | MPSGraph float16 convolutions | 6.10-6.26 ms |
 | libplacebo/MoltenVK, original GLSL | 6.37 ms |
 
 libplacebo's own per-pass GPU timers report about 0.5 ms at 1512x982 on MoltenVK, which
 would exceed the GPU's peak arithmetic rate by 9x, so only wall-clock time is compared.
+
+## Layout
+
+The GLSL stores each 16-channel activation as a texture twice the input size, with the
+four channel groups in a 2x2 block of texels. Here each one is a 4-slice texture array at
+input size, so a SIMD group writing one channel group writes contiguous rows; the
+`load`/`store` helpers map the GLSL's tiled coordinates onto slices. This cut last-level
+cache traffic by 30% and frame time from 5.95 ms to 5.61 ms.
+
+## Profiling
+
+`tools/counters.py` summarizes GPU limiter counters from an `xctrace` recording made with an
+Instruments template that has the Metal GPU Counters instrument set to "Performance
+Limiters" (the counter set can only be chosen in the Instruments app; save it as a
+template once, then record from the command line):
+
+```
+xcrun xctrace record --template ArtCNN --env ARTCNN_ONLY_PASS=1 --output layer.trace \
+    --launch -- build/artcnn_metal_cli ArtCNN_C4F16_DS.metal in.f32 1512 982 out.f32 400
+python tools/counters.py layer.trace
+```
+
+For a 16->16 Winograd layer the GPU holds occupancy at about 33% (occupancy manager
+target 42%) with the F16 limiter at 73% and the last-level cache limiter at 85%; a plain
+copy kernel reaches 89% occupancy. Raising occupancy is the next lever.
 
 ## Where the time goes
 

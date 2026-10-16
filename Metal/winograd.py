@@ -115,8 +115,9 @@ def emit_winograd(emit, w, b, relu, src, tx, ty, indent):
 
 
 def kernel_header(emit, index, binds):
-    params = [f"texture2d<half> {name} [[texture({i})]]" for i, name in enumerate(binds)]
-    params.append(f"texture2d<half, access::write> out_image [[texture({len(binds)})]]")
+    # 16->16 passes read and write the 4-slice activation arrays (see translate.py).
+    params = [f"texture2d_array<half> {name} [[texture({i})]]" for i, name in enumerate(binds)]
+    params.append(f"texture2d_array<half, access::write> out_image [[texture({len(binds)})]]")
     params += ["uint2 tgid [[threadgroup_position_in_grid]]",
                "uint tid [[thread_index_in_threadgroup]]",
                "ushort sg [[simdgroup_index_in_threadgroup]]",
@@ -164,7 +165,7 @@ def fused_kernel(index, pa, wa, ba, pb, wb, bb):
     emit(f"    threadgroup half4 staged[4][{sh}][2][{sw // 2}];")
     emit(f"    threadgroup half4 mid[4][{mh}][2][{mw // 2}];")
     emit(f"    const int2 block = int2(tgid) * int2({BLOCK_W}, {BLOCK_H});")
-    emit(f"    const int2 size = int2(out_image.get_width(), out_image.get_height()) / 2;")
+    emit("    const int2 size = int2(out_image.get_width(), out_image.get_height());")
     emit_stage(emit, pa.binds[0], "block - 2", sw, sh)
     emit(f"    for (uint tile = lane; tile < {mtx * mty}; tile += 32) {{")
     emit(f"        const uint tx = tile % {mtx}, ty = tile / {mtx};")

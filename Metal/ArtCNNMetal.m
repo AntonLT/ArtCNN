@@ -74,10 +74,22 @@
 
 - (id<MTLTexture>)newTextureWithFormat:(MTLPixelFormat)format width:(NSUInteger)width height:(NSUInteger)height
 {
+    return [self newTextureWithFormat:format width:width height:height slices:1];
+}
+
+- (id<MTLTexture>)newTextureWithFormat:(MTLPixelFormat)format
+                                 width:(NSUInteger)width
+                                height:(NSUInteger)height
+                                slices:(NSUInteger)slices
+{
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
                                                                                     width:width
                                                                                    height:height
                                                                                 mipmapped:NO];
+    if (slices > 1) {
+        desc.textureType = MTLTextureType2DArray;
+        desc.arrayLength = slices;
+    }
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     desc.storageMode = MTLStorageModePrivate;
     return [_device newTextureWithDescriptor:desc];
@@ -100,9 +112,13 @@
         if ([pass.save isEqualToString:@"OUTPUT"]) {
             continue;
         }
+        // A pass at 2x scale produces 16 channels, stored as 4 slices at input size;
+        // the generated kernels map the GLSL's 2x2 tiled coordinates onto the slices.
+        BOOL tiled = pass.scaleX == 2 && pass.scaleY == 2;
         id<MTLTexture> texture = [self newTextureWithFormat:_float32 ? MTLPixelFormatRGBA32Float : MTLPixelFormatRGBA16Float
-                                                      width:(NSUInteger)(width * pass.scaleX)
-                                                     height:(NSUInteger)(height * pass.scaleY)];
+                                                      width:tiled ? width : (NSUInteger)(width * pass.scaleX)
+                                                     height:tiled ? height : (NSUInteger)(height * pass.scaleY)
+                                                     slices:tiled ? 4 : 1];
         if (!texture) {
             return NO;
         }
@@ -144,8 +160,10 @@
         id<MTLTexture> target = [pass.save isEqualToString:@"OUTPUT"] ? output : _textures[pass.save];
         [encoder setTexture:target atIndex:index];
 
-        MTLSize groups = MTLSizeMake((target.width + pass.block.width - 1) / pass.block.width,
-                                     (target.height + pass.block.height - 1) / pass.block.height,
+        // Block sizes are in the pass's GLSL output coordinates (input size times scale).
+        NSUInteger outW = (NSUInteger)(input.width * pass.scaleX), outH = (NSUInteger)(input.height * pass.scaleY);
+        MTLSize groups = MTLSizeMake((outW + pass.block.width - 1) / pass.block.width,
+                                     (outH + pass.block.height - 1) / pass.block.height,
                                      1);
         [encoder dispatchThreadgroups:groups threadsPerThreadgroup:pass.threads];
     }

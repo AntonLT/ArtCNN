@@ -50,12 +50,18 @@ int main(int argc, const char *argv[])
         id<MTLTexture> output = [artcnn newOutputTextureForInputWidth:width height:height];
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
+        // ARTCNN_ONLY_PASS=n runs just that pass in the timing loops, for counter captures.
+        NSRange passes = NSMakeRange(0, artcnn.passCount);
+        if (getenv("ARTCNN_ONLY_PASS")) {
+            passes = NSMakeRange(strtoul(getenv("ARTCNN_ONLY_PASS"), NULL, 10), 1);
+            [artcnn encodeToCommandBuffer:[queue commandBuffer] input:input output:output];
+        }
         NSMutableArray<NSNumber *> *times = [NSMutableArray array];
         NSMutableArray<NSNumber *> *wall = [NSMutableArray array];
         for (int i = -10; i < iterations || i < 0; i++) {
             CFTimeInterval start = CACurrentMediaTime();
             id<MTLCommandBuffer> cb = [queue commandBuffer];
-            if (![artcnn encodeToCommandBuffer:cb input:input output:output]) {
+            if (![artcnn encodeToCommandBuffer:cb input:input output:output passes:passes]) {
                 fprintf(stderr, "encode failed\n");
                 return 1;
             }
@@ -91,7 +97,7 @@ int main(int argc, const char *argv[])
             id<MTLCommandBuffer> last = nil;
             for (int i = 0; i < iterations; i++) {
                 last = [queue commandBuffer];
-                [artcnn encodeToCommandBuffer:last input:input output:output];
+                [artcnn encodeToCommandBuffer:last input:input output:output passes:passes];
                 [last commit];
             }
             [last waitUntilCompleted];
