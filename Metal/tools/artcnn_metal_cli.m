@@ -71,6 +71,20 @@ int main(int argc, const char *argv[])
             }
         }
 
+        if (iterations > 0 && getenv("ARTCNN_PROFILE")) {
+            for (NSUInteger p = 0; p < artcnn.passCount; p++) {
+                CFTimeInterval start = CACurrentMediaTime();
+                id<MTLCommandBuffer> last = nil;
+                for (int i = 0; i < iterations; i++) {
+                    last = [queue commandBuffer];
+                    [artcnn encodeToCommandBuffer:last input:input output:output passes:NSMakeRange(p, 1)];
+                    [last commit];
+                }
+                [last waitUntilCompleted];
+                printf("  pass %lu: %.3f ms\n", (unsigned long)p, (CACurrentMediaTime() - start) * 1000.0 / iterations);
+            }
+        }
+
         double batchMs = 0;
         if (iterations > 0) {
             CFTimeInterval start = CACurrentMediaTime();

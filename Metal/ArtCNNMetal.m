@@ -113,16 +113,29 @@
     return YES;
 }
 
+- (NSUInteger)passCount
+{
+    return _passes.count;
+}
+
 - (BOOL)encodeToCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
                         input:(id<MTLTexture>)input
                        output:(id<MTLTexture>)output
+{
+    return [self encodeToCommandBuffer:commandBuffer input:input output:output passes:NSMakeRange(0, _passes.count)];
+}
+
+- (BOOL)encodeToCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+                        input:(id<MTLTexture>)input
+                       output:(id<MTLTexture>)output
+                       passes:(NSRange)range
 {
     if (![self prepareForWidth:input.width height:input.height]) {
         return NO;
     }
 
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-    for (ArtCNNPass *pass in _passes) {
+    for (ArtCNNPass *pass in [_passes subarrayWithRange:range]) {
         [encoder setComputePipelineState:pass.pipeline];
         NSUInteger index = 0;
         for (NSString *bind in pass.binds) {

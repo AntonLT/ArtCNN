@@ -18,6 +18,14 @@ NS_ASSUME_NONNULL_BEGIN
                         input:(id<MTLTexture>)input
                        output:(id<MTLTexture>)output;
 
+// Encodes only the passes in range, for per-pass profiling.
+- (BOOL)encodeToCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+                        input:(id<MTLTexture>)input
+                       output:(id<MTLTexture>)output
+                       passes:(NSRange)range;
+
+@property (nonatomic, readonly) NSUInteger passCount;
+
 - (nullable id<MTLTexture>)newOutputTextureForInputWidth:(NSUInteger)width height:(NSUInteger)height;
 
 @end
