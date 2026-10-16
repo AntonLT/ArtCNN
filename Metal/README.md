@@ -88,6 +88,11 @@ companding 58 dB (up to 5 codes). With a 16->16 layer at 0.60 ms either way, the
 no longer limited by memory traffic: counters show the F16 limiter at 85% and instruction
 throughput at 80%, mostly the 8x8 matrix products.
 
+Winograd F(4x4, 3x3) would cut the matrix products by 1.8x, but simulated in float16
+(`tools/winograd_precision.py`) it loses too much precision on fine detail: on a real image
+crop 78.6 dB against float32 (max 1 code), on noise 50.2 dB with errors up to 24 codes,
+where F(2x2, 3x3) stays at 86.2 dB and 64.7 dB with at most 1 code.
+
 ## How the 16->16 kernel works
 
 Each threadgroup computes a 16x8 pixel block (32 Winograd tiles) with 128 threads:
