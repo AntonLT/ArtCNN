@@ -72,6 +72,22 @@ removes a 47 MB write and two 47 MB reads: 3.51 ms per frame at 1512x982 instead
 with identical output. Computing it per (pixel, channel group) instead re-read the luma
 neighborhood four times and gained nothing.
 
+## Storage experiments
+
+Measured after the first-conv change (3.51 ms per frame at 1512x982):
+
+| Change | Result |
+|---|---|
+| Device buffers instead of texture arrays (copy kernel, one activation) | 0.41 ms vs 0.39 ms, no gain |
+| 8-bit activations (RGBA8 storage, speed only) | 3.48 ms vs 3.52 ms, 1% |
+
+8-bit storage would also cost quality: simulated in NumPy (`tools/quantize_sim.py`) with
+per-channel scales from the maximum over a calibration set plus 10%, linear 8 bits gives
+47-48 dB against the unquantized network on real images (up to 10 codes off) and square-root
+companding 58 dB (up to 5 codes). With a 16->16 layer at 0.60 ms either way, the layers are
+no longer limited by memory traffic: counters show the F16 limiter at 85% and instruction
+throughput at 80%, mostly the 8x8 matrix products.
+
 ## How the 16->16 kernel works
 
 Each threadgroup computes a 16x8 pixel block (32 Winograd tiles) with 128 threads:
